@@ -49,6 +49,13 @@ export interface RuntimeChildManagerOptions {
 	 * Node process, so generous headroom matters for multi-agent workloads.
 	 */
 	maxOldSpaceMb?: number;
+	/**
+	 * Absolute path to a cli.js the shim should execute instead of the
+	 * bundled one. Forwarded via `KANBAN_CLI_OVERRIDE`; the shim
+	 * revalidates `existsSync` and falls back to the bundled cli.js if
+	 * stale. Empty string === undefined.
+	 */
+	cliEntryOverride?: string;
 	spawnFn?: typeof spawn;
 }
 
@@ -147,6 +154,7 @@ export class RuntimeChildManager extends EventEmitter<RuntimeChildManagerEvents>
 		pollIntervalMs: number;
 		startupTimeoutMs: number;
 		maxOldSpaceMb: number;
+		cliEntryOverride: string | undefined;
 		spawnFn: typeof spawn;
 	};
 
@@ -163,6 +171,13 @@ export class RuntimeChildManager extends EventEmitter<RuntimeChildManagerEvents>
 			pollIntervalMs: options.pollIntervalMs ?? 200,
 			startupTimeoutMs: options.startupTimeoutMs ?? 30_000,
 			maxOldSpaceMb: options.maxOldSpaceMb ?? DEFAULT_MAX_OLD_SPACE_MB,
+			// "" → undefined: the shim's `[ -n ... ]` guard would skip
+			// an empty value anyway, but an empty env var is observably
+			// wrong in process listings.
+			cliEntryOverride:
+				options.cliEntryOverride && options.cliEntryOverride.length > 0
+					? options.cliEntryOverride
+					: undefined,
 			spawnFn: options.spawnFn ?? spawn,
 		};
 	}
@@ -214,6 +229,9 @@ export class RuntimeChildManager extends EventEmitter<RuntimeChildManagerEvents>
 
 		const env = buildFilteredEnv();
 		env.KANBAN_DESKTOP = "1";
+		if (this.opts.cliEntryOverride !== undefined) {
+			env.KANBAN_CLI_OVERRIDE = this.opts.cliEntryOverride;
+		}
 		// Merge our V8 heap limit with any existing NODE_OPTIONS from parent.
 		// Strip both hyphen and underscore variants to avoid duplicates.
 		const existingNodeOptions = env.NODE_OPTIONS?.trim() || "";

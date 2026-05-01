@@ -14,6 +14,29 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESOURCES_DIR="$(dirname "$SCRIPT_DIR")"
 CLI_ENTRY="$RESOURCES_DIR/app.asar.unpacked/cli/cli.js"
 
+# Runtime-update override (issue #438 / Channel 1). The desktop's
+# orchestrator validates the override path *before* spawn (the
+# RuntimeResolver only emits paths it just `existsSync`-confirmed),
+# then sets KANBAN_CLI_OVERRIDE on the spawned shim's environment.
+#
+# We trust the parent: if the var is set we use it as-is, and if the
+# file is missing we **fail loudly** rather than silently falling back
+# to the bundled CLI. Silent fallback would desynchronize the parent's
+# rollback bookkeeping — the orchestrator's `currentResolvedRuntime`
+# records a non-bundled launch, and a subsequent crash would mark the
+# user's runtime bad even though the bundled CLI is what actually ran.
+# Failing loudly here keeps the parent and child agreed on which
+# runtime is in play.
+if [ -n "$KANBAN_CLI_OVERRIDE" ]; then
+  if [ ! -f "$KANBAN_CLI_OVERRIDE" ]; then
+    echo "error: KANBAN_CLI_OVERRIDE points to missing file: $KANBAN_CLI_OVERRIDE" >&2
+    echo "       refusing to silently fall back to the bundled CLI" >&2
+    echo "       (the parent orchestrator's rollback state would desync)" >&2
+    exit 1
+  fi
+  CLI_ENTRY="$KANBAN_CLI_OVERRIDE"
+fi
+
 if [ ! -f "$CLI_ENTRY" ]; then
   echo "error: Kanban CLI not found at $CLI_ENTRY" >&2
   exit 1

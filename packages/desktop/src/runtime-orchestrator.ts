@@ -3,7 +3,20 @@ import { existsSync } from "node:fs";
 import { powerSaveBlocker } from "electron";
 
 import { RuntimeChildManager } from "./runtime-child.js";
+import { type ResolvedRuntime, resolveRuntime } from "./runtime-resolver.js";
+import type { RuntimeStore } from "./runtime-store.js";
 
+/**
+ * Runtime-store wiring. When present, the orchestrator picks which cli.js
+ * the shim should execute (via the 3-arm resolver) and demotes versions
+ * that fail their startup probe. Absent in dev — the spawned shim uses
+ * its own bundled-CLI resolution.
+ */
+export interface RuntimeManagement {
+	store: RuntimeStore;
+	bundledCliEntry: string;
+	bundledVersion: string | null;
+}
 
 interface RuntimeOrchestratorOptions {
 
@@ -11,6 +24,7 @@ interface RuntimeOrchestratorOptions {
 	port: number;
 	healthTimeoutMs: number;
 	resolveCliShimPath: () => string;
+	runtimeManagement?: RuntimeManagement | null;
 	fetchImpl?: typeof fetch;
 	attachedProbeIntervalMs?: number;
 	attachedProbeFailureThreshold?: number;
@@ -20,6 +34,12 @@ interface RuntimeOrchestratorOptions {
 interface RuntimeOrchestratorEventMap {
 	"url-changed": [url: string | null];
 	crashed: [];
+	/**
+	 * Emitted when a non-bundled runtime failed to start and was marked
+	 * bad. Listeners can surface a "rolled back to previous version"
+	 * toast. `null` only if the resolver returned a version-less arm.
+	 */
+	"runtime-rolled-back": [demotedVersion: string | null];
 }
 
 // Aggressive — defends against the attached runtime's own bundled web-ui
@@ -71,6 +91,11 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	// at spawn time. Initial value `null` distinguishes "not yet looked
 	// up" from "looked up and resolved to a string".
 	private cachedShimPath: string | null = null;
+	// Verdict from the most recent resolver call, captured at spawn time
+	// so the failure path marks the version we actually launched (resolver
+	// state may have shifted by then). Lives across `manager.start()` and
+	// any post-ready `manager.on("error")` event for the same spawn.
+	private currentResolvedRuntime: ResolvedRuntime | null = null;
 
 	// Latched once `shutdown()` / `dispose()` begin. Every `await` boundary
 	// in the lifecycle methods (`connect`, `restart`, `startOwnRuntime`)
@@ -353,12 +378,34 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 				this.manager.removeAllListeners("error");
 				this.manager = null;
 			}
+			// Rollback: a non-bundled runtime that fails to reach the
+			// ready-poll cutoff is broken; mark it bad before re-throwing
+			// so the next boot resolves to a previous good version.
+			const reason = err instanceof Error ? err.message : String(err);
+			this.demoteCurrentRuntimeIfNonBundled(reason);
 			// Suppress on terminated — caller (drain inside shutdown/dispose)
 			// already moved past the point where it cares about the spawn
 			// failure, and re-throwing would surface as an unhandled
 			// rejection on the abandoned promise.
 			if (this.terminated) return;
 			throw err;
+		}
+	}
+
+	/**
+	 * Boot-time runtime-store maintenance: sweep stale `*.partial` dirs.
+	 * Best-effort; failures are logged. No-op without `runtimeManagement`.
+	 */
+	async maintain(): Promise<void> {
+		const mgmt = this.opts.runtimeManagement;
+		if (!mgmt) return;
+		try {
+			mgmt.store.cleanupPartials();
+		} catch (err) {
+			console.warn(
+				"[desktop] runtime store cleanupPartials failed:",
+				err instanceof Error ? err.message : err,
+			);
 		}
 	}
 
@@ -389,10 +436,65 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 		return resolved;
 	}
 
+	/**
+	 * Resolve which cli.js the shim should execute and capture the verdict
+	 * for this spawn. Returns `undefined` when there's no runtime store or
+	 * the bundled arm was picked (the shim finds that path itself).
+	 */
+	private resolveCliEntryOverride(): string | undefined {
+		const mgmt = this.opts.runtimeManagement;
+		if (!mgmt) {
+			this.currentResolvedRuntime = null;
+			return undefined;
+		}
+		const resolved = resolveRuntime(mgmt);
+		this.currentResolvedRuntime = resolved;
+		if (resolved.source === "bundled") return undefined;
+		console.log(
+			`[desktop] Runtime resolver selected version=${resolved.version ?? "unknown"} source=${resolved.source} (pointer=${resolved.pointerVersion ?? "<none>"})`,
+		);
+		return resolved.cliEntryAbsolutePath;
+	}
+
+	/**
+	 * Mark the current spawn's runtime bad (non-bundled only) and emit
+	 * `runtime-rolled-back`. Failure-resilient — never throws so it can't
+	 * mask the original spawn error.
+	 */
+	private demoteCurrentRuntimeIfNonBundled(reason: string): void {
+		const resolved = this.currentResolvedRuntime;
+		this.currentResolvedRuntime = null;
+		if (!resolved || resolved.source === "bundled") return;
+		const mgmt = this.opts.runtimeManagement;
+		if (!mgmt) return;
+		const demoted = resolved.version;
+		if (!demoted) {
+			console.warn(
+				`[desktop] Runtime (${resolved.source}) failed: ${reason}. Skipping demote — resolved version is null.`,
+			);
+			return;
+		}
+		console.warn(
+			`[desktop] Runtime ${demoted} (${resolved.source}) failed: ${reason}. Marking bad and rolling back on next boot.`,
+		);
+		try {
+			// Mark the *resolved* version, not the pointer — fallback-arm
+			// spawns differ from the pointer.
+			mgmt.store.markBad(demoted);
+		} catch (err) {
+			console.warn(
+				"[desktop] markBad failed:",
+				err instanceof Error ? err.message : err,
+			);
+		}
+		this.emit("runtime-rolled-back", demoted);
+	}
+
 	private createManager(): RuntimeChildManager {
 		const manager = new RuntimeChildManager({
 			cliPath: this.getValidatedShimPath(),
 			shutdownTimeoutMs: DEFAULT_CHILD_SHUTDOWN_TIMEOUT_MS,
+			cliEntryOverride: this.resolveCliEntryOverride(),
 		});
 
 

@@ -1,5 +1,10 @@
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createRuntimeStore, type RuntimeStore } from "../src/runtime-store.js";
 
 vi.mock("electron", () => ({
 	powerSaveBlocker: {
@@ -13,11 +18,34 @@ vi.mock("electron", () => ({
 const childManagers: FakeChildManager[] = [];
 
 class FakeChildManager extends EventEmitter {
-	constructor() {
+	/**
+	 * When set, the *next* `start()` call rejects with this error then
+	 * clears the field. Used by the runtime-rollback tests to simulate
+	 * a startup failure (e.g. the user-installed cli.js exited before
+	 * passing the health probe). Other tests don't touch this and so
+	 * see the default success path. One-shot semantics keep tests from
+	 * interfering with each other on shared state.
+	 */
+	static nextStartError: Error | null = null;
+	/**
+	 * Records every options object the orchestrator passed to the
+	 * RuntimeChildManager constructor, in order. Used by the resolver
+	 * integration tests to assert the spawn picked up the right
+	 * `cliEntryOverride` after the resolver was queried.
+	 */
+	static lastConstructorOptions: Array<Record<string, unknown>> = [];
+
+	constructor(options: Record<string, unknown> = {}) {
 		super();
+		FakeChildManager.lastConstructorOptions.push(options);
 		childManagers.push(this);
 	}
 	async start(): Promise<string> {
+		const err = FakeChildManager.nextStartError;
+		if (err) {
+			FakeChildManager.nextStartError = null;
+			throw err;
+		}
 		return "http://127.0.0.1:3484";
 	}
 	async shutdown(): Promise<void> {}
@@ -1787,7 +1815,7 @@ describe("RuntimeOrchestrator health-probe runtime identification", () => {
 		await orchestrator.shutdown();
 	});
 
-	it("checkHealth() public method returns false for title-less 200", async () => {
+	it("checkHealth() public method returns false for title-less 200 (regression: title-grep no-op)", async () => {
 		// Direct API-surface check — guards against the title grep being
 		// regressed into a no-op (e.g. someone removing the .text() read
 		// during a refactor).
@@ -1809,6 +1837,168 @@ describe("RuntimeOrchestrator health-probe runtime identification", () => {
 		expect(await orchestrator.checkHealth("http://127.0.0.1:3484")).toBe(false);
 
 		await orchestrator.dispose();
+	});
+});
+
+// ---------------------------------------------------------------------
+// Runtime-store maintenance + non-bundled rollback. Uses a real
+// runtime store against a tmpdir — mocking it would re-stub the very
+// contract we're trying to pin.
+// ---------------------------------------------------------------------
+describe("RuntimeOrchestrator runtime-store maintenance + non-bundled rollback", () => {
+	let tmpRoot: string;
+	let store: RuntimeStore;
+	const bundledCliEntry = process.execPath; // any file that exists
+	const bundledVersion = "0.0.1";
+
+	/**
+	 * Lay out `versions/<v>/dist/cli.js` (the installer's canonical layout)
+	 * and point `current.json` at it.
+	 */
+	function stageInstalledRuntime(version: string): void {
+		const distDir = path.join(tmpRoot, "versions", version, "dist");
+		mkdirSync(distDir, { recursive: true });
+		writeFileSync(path.join(distDir, "cli.js"), "// noop\n");
+		store.writePointer({
+			version,
+			installedAt: new Date().toISOString(),
+			cliEntry: "dist/cli.js",
+		});
+	}
+
+	beforeEach(() => {
+		tmpRoot = mkdtempSync(path.join(tmpdir(), "kanban-orch-rs-"));
+		store = createRuntimeStore(tmpRoot);
+		childManagers.length = 0;
+	});
+
+	afterEach(() => {
+		rmSync(tmpRoot, { recursive: true, force: true });
+	});
+
+	it("maintain() is a no-op without runtimeManagement", async () => {
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn() as unknown as typeof fetch,
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+		await expect(orchestrator.maintain()).resolves.toBeUndefined();
+	});
+
+	it("maintain() invokes store.cleanupPartials and swallows failures (boot must not crash)", async () => {
+		const cleanupSpy = vi.spyOn(store, "cleanupPartials");
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn() as unknown as typeof fetch,
+			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		await orchestrator.maintain();
+		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+
+		// One-shot failure: must not throw, must not abort boot.
+		cleanupSpy.mockImplementationOnce(() => {
+			throw new Error("simulated I/O failure");
+		});
+		await expect(orchestrator.maintain()).resolves.toBeUndefined();
+		expect(cleanupSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("startup failure on a non-bundled resolved runtime marks the *resolved* version bad and emits runtime-rolled-back", async () => {
+		// Pointer is 0.99.1 (already bad); 0.99.0 is the best fallback.
+		// Spawn fails — orchestrator must mark 0.99.0 (the version it
+		// actually launched), not 0.99.1.
+		stageInstalledRuntime("0.99.0");
+		stageInstalledRuntime("0.99.1");
+		store.markBad("0.99.1");
+
+		FakeChildManager.nextStartError = new Error(
+			"runtime exited during startup: ENOENT cli.js",
+		);
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		const rollbackEvents: Array<string | null> = [];
+		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
+
+		await expect(orchestrator.connect()).rejects.toThrow(/exited during startup/);
+
+		expect(rollbackEvents).toEqual(["0.99.0"]);
+		expect(store.isBad("0.99.0")).toBe(true);
+		expect(store.isBad("0.99.1")).toBe(true); // unchanged
+	});
+
+	it("does NOT mark bad when the failed spawn was using the bundled arm", async () => {
+		// No installed versions → resolver picks bundled. A startup
+		// failure here is a packaging issue; nothing to demote.
+		FakeChildManager.nextStartError = new Error("ENOENT bundled cli");
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		const rollbackEvents: Array<string | null> = [];
+		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
+
+		await expect(orchestrator.connect()).rejects.toThrow(/ENOENT bundled cli/);
+		expect(rollbackEvents).toEqual([]);
+		expect(store.listVersions()).toEqual([]); // no bad markers written
+	});
+
+	it("does NOT mark bad on a successful spawn", async () => {
+		stageInstalledRuntime("0.99.0");
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		const rollbackEvents: Array<string | null> = [];
+		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
+
+		await orchestrator.connect();
+		expect(orchestrator.isOwned()).toBe(true);
+		expect(rollbackEvents).toEqual([]);
+		expect(store.isBad("0.99.0")).toBe(false);
+
+		await orchestrator.shutdown();
 	});
 });
 

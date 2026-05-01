@@ -11,6 +11,25 @@ set "SCRIPT_DIR=%~dp0"
 set "RESOURCES_DIR=%SCRIPT_DIR%.."
 set "CLI_ENTRY=%RESOURCES_DIR%\app.asar.unpacked\cli\cli.js"
 
+REM Runtime-update override (issue #438 / Channel 1). The desktop's
+REM orchestrator validates the override path before spawn; if it sets
+REM KANBAN_CLI_OVERRIDE we use it as-is. If the file is missing we
+REM **fail loudly** rather than silently falling back to the bundled
+REM CLI — silent fallback would desynchronize the parent's rollback
+REM bookkeeping (parent records a non-bundled launch, child actually
+REM runs the bundled CLI, a subsequent crash marks the wrong version
+REM bad). See the POSIX shim's longer comment for the full rationale.
+if defined KANBAN_CLI_OVERRIDE (
+  if not exist "%KANBAN_CLI_OVERRIDE%" (
+    echo error: KANBAN_CLI_OVERRIDE points to missing file: %KANBAN_CLI_OVERRIDE% >&2
+    echo        refusing to silently fall back to the bundled CLI >&2
+    echo        ^(the parent orchestrator's rollback state would desync^) >&2
+    endlocal
+    exit /b 1
+  )
+  set "CLI_ENTRY=%KANBAN_CLI_OVERRIDE%"
+)
+
 REM Windows packaged layout:
 REM   Kanban\resources\bin\kanban.cmd     (this file)
 REM   RESOURCES_DIR = Kanban\resources
