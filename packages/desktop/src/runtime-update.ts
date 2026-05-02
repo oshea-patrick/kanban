@@ -57,6 +57,27 @@ import {
 
 const PACKAGE_NAME = "kanban";
 
+/**
+ * Runtime deps the shell knows how to satisfy from
+ * `app.asar.unpacked/node_modules/`. Today this is exactly `node-pty`,
+ * because Kanban's build (`scripts/build.mjs`) declares that as the
+ * sole esbuild external — every other runtime dep is inlined into
+ * `dist/cli.js`. If a future `kanban@latest` adds a new native dep
+ * (or marks a JS dep external), this set must grow alongside it OR
+ * the version is rejected as `unsupported-deps`.
+ *
+ * Note on `node-addon-api`: node-pty/package.json declares it as a
+ * runtime dependency, but at runtime it isn't required — node-pty
+ * loads its native binding via `require(<dir>/<name>.node)` from
+ * `node-pty/prebuilds/`, and the prebuilt .node binaries are
+ * self-contained. node-addon-api is consumed only by `binding.gyp`
+ * during a from-source build (header-only C++ helper). Empirically,
+ * a `node_modules/` containing only `node-pty/` is sufficient for
+ * `require('node-pty').spawn(...)` to work. So we don't stage it.
+ */
+const KNOWN_STAGEABLE_DEPS = new Set(["node-pty"]);
+
+
 export interface CheckOptions {
 	/** Electron `app.getPath("userData")`. */
 	userData: string;
@@ -88,7 +109,8 @@ export type StageOutcome =
 	| { kind: "up-to-date" }
 	| { kind: "already-staged" }
 	| { kind: "bad-version"; version: string }
-	| { kind: "engines-incompatible"; version: string; required: string };
+	| { kind: "engines-incompatible"; version: string; required: string }
+	| { kind: "unsupported-deps"; version: string; extraDeps: string[] };
 
 export async function checkAndStageLatestRuntime(
 	opts: CheckOptions,
@@ -133,6 +155,24 @@ export async function checkAndStageLatestRuntime(
 			version: latest,
 			required: requiredNode,
 		};
+	}
+
+	// Dependency-closure gate. The shell only knows how to satisfy
+	// `KNOWN_STAGEABLE_DEPS` from `app.asar.unpacked/node_modules/`;
+	// every other dep that kanban's build leaves un-bundled would be
+	// missing at runtime under `versions/<v>/node_modules/`. If a
+	// future kanban@latest grows a new external dep, refuse to stage
+	// it (instead of silently shipping a runtime that crashes on first
+	// `require`) until the desktop shell adds support.
+	//
+	// Caveat: this only sees deps the *manifest* declares. A runtime
+	// that adds an `external` to its esbuild config without updating
+	// package.json would still slip through; that's a build-side bug
+	// and would surface as a startup failure → markBadVersion fallback.
+	const declaredDeps = Object.keys(manifest.dependencies ?? {});
+	const extraDeps = declaredDeps.filter((d) => !KNOWN_STAGEABLE_DEPS.has(d));
+	if (extraDeps.length > 0) {
+		return { kind: "unsupported-deps", version: latest, extraDeps };
 	}
 
 	// Pointer already targets this version — a previous tick staged

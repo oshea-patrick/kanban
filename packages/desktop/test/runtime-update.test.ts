@@ -202,6 +202,57 @@ describe("checkAndStageLatestRuntime: bad-version + engines gates", () => {
 
 		expect(outcome).toEqual({ kind: "staged", stagedVersion: "2.0.0" });
 	});
+
+	it("stages when manifest declares node-pty as the sole runtime dep (allowlisted)", async () => {
+		// node-addon-api intentionally not staged: it's a build-time-only
+		// header dep of node-pty (consumed by binding.gyp), not a runtime
+		// require. Verified empirically; documented in runtime-update.ts.
+		manifestMock.mockResolvedValueOnce({
+			version: "1.0.0",
+			engines: {},
+			dependencies: { "node-pty": "^1.0.0" },
+		});
+
+		const outcome = await checkAndStageLatestRuntime({
+			userData,
+			currentVersion: "0.5.0",
+			nativeDepsSource,
+		});
+
+		expect(outcome).toEqual({ kind: "staged", stagedVersion: "1.0.0" });
+	});
+
+	it("returns unsupported-deps when manifest declares an external the shell can't satisfy", async () => {
+		// Defensive guardrail. A future kanban release that adds e.g.
+		// `better-sqlite3` as an external would otherwise stage a
+		// runtime that crashes at first `require`. The check refuses
+		// to stage rather than staging-then-rolling-back; the failure
+		// is loud (warn log) so the next desktop release can extend
+		// KNOWN_STAGEABLE_DEPS.
+		manifestMock.mockResolvedValueOnce({
+			version: "2.0.0",
+			engines: {},
+			dependencies: {
+				"node-pty": "^1.0.0",
+				"better-sqlite3": "^11.0.0",
+				"some-other-native": "^1.0.0",
+			},
+		});
+
+		const outcome = await checkAndStageLatestRuntime({
+			userData,
+			currentVersion: "0.5.0",
+			nativeDepsSource,
+		});
+
+		expect(outcome).toEqual({
+			kind: "unsupported-deps",
+			version: "2.0.0",
+			extraDeps: ["better-sqlite3", "some-other-native"],
+		});
+		expect(extractMock).not.toHaveBeenCalled();
+		expect(readPointer(userData)).toBeNull();
+	});
 });
 
 describe("checkAndStageLatestRuntime: staging", () => {

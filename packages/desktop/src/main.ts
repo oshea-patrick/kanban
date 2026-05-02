@@ -454,6 +454,15 @@ async function runRuntimeUpdateCheck(cfg: RuntimeUpdateConfig): Promise<void> {
 			console.log(
 				`[desktop] Skipping kanban@${outcome.version}: previously failed startup on this shell.`,
 			);
+		} else if (outcome.kind === "unsupported-deps") {
+			// Defensive guardrail. If a future kanban@latest grows a new
+			// runtime dep the shell doesn't know how to provision from
+			// `app.asar.unpacked/node_modules/`, we'd otherwise stage a
+			// runtime that crashes at first `require`. Log loudly so the
+			// next desktop release can extend KNOWN_STAGEABLE_DEPS.
+			console.warn(
+				`[desktop] Skipping kanban@${outcome.version}: unsupported runtime deps ${outcome.extraDeps.join(", ")}.`,
+			);
 		}
 	} catch (err) {
 		// Network errors, registry hiccups, missing native deps — log
