@@ -3,28 +3,29 @@ import { existsSync } from "node:fs";
 import { powerSaveBlocker } from "electron";
 
 import { RuntimeChildManager } from "./runtime-child.js";
-import { type ResolvedRuntime, resolveRuntime } from "./runtime-resolver.js";
-import type { RuntimeStore } from "./runtime-store.js";
-
-/**
- * Runtime-store wiring. When present, the orchestrator picks which cli.js
- * the shim should execute (via the 3-arm resolver) and demotes versions
- * that fail their startup probe. Absent in dev — the spawned shim uses
- * its own bundled-CLI resolution.
- */
-export interface RuntimeManagement {
-	store: RuntimeStore;
-	bundledCliEntry: string;
-	bundledVersion: string | null;
-}
 
 interface RuntimeOrchestratorOptions {
-
 	host: string;
 	port: number;
 	healthTimeoutMs: number;
 	resolveCliShimPath: () => string;
-	runtimeManagement?: RuntimeManagement | null;
+	/**
+	 * Optional callback resolving the absolute path to a staged
+	 * `cli.js` that should run instead of the shim's bundled cli.
+	 * Returning `null` (or omitting the option) lets the shim use its
+	 * bundled `cli.js`. Re-evaluated on every spawn so a freshly-staged
+	 * runtime takes effect on the next restart.
+	 */
+	resolveCliEntryOverride?: () => string | null;
+	/**
+	 * Called when a spawn that *was* using a `cliEntryOverride` failed
+	 * to reach the ready-poll cutoff. The orchestrator clears the
+	 * override locally and retries the spawn once with the bundled
+	 * runtime — same launch, no user action required. The callback
+	 * itself is responsible for clearing the persistent pointer so
+	 * subsequent boots also fall back.
+	 */
+	onCliEntryOverrideFailed?: (reason: string) => void;
 	fetchImpl?: typeof fetch;
 	attachedProbeIntervalMs?: number;
 	attachedProbeFailureThreshold?: number;
@@ -34,12 +35,6 @@ interface RuntimeOrchestratorOptions {
 interface RuntimeOrchestratorEventMap {
 	"url-changed": [url: string | null];
 	crashed: [];
-	/**
-	 * Emitted when a non-bundled runtime failed to start and was marked
-	 * bad. Listeners can surface a "rolled back to previous version"
-	 * toast. `null` only if the resolver returned a version-less arm.
-	 */
-	"runtime-rolled-back": [demotedVersion: string | null];
 }
 
 // Aggressive — defends against the attached runtime's own bundled web-ui
@@ -91,11 +86,17 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	// at spawn time. Initial value `null` distinguishes "not yet looked
 	// up" from "looked up and resolved to a string".
 	private cachedShimPath: string | null = null;
-	// Verdict from the most recent resolver call, captured at spawn time
-	// so the failure path marks the version we actually launched (resolver
-	// state may have shifted by then). Lives across `manager.start()` and
-	// any post-ready `manager.on("error")` event for the same spawn.
-	private currentResolvedRuntime: ResolvedRuntime | null = null;
+	// Whether the *current* spawn is using a `cliEntryOverride` (i.e. a
+	// staged runtime). Captured at spawn time so the failure path can
+	// route to `onCliEntryOverrideFailed` for the version that actually
+	// ran, even if `resolveCliEntryOverride()` would now return something
+	// different.
+	private currentSpawnUsedOverride = false;
+	// Latched for the duration of one same-launch retry after a staged
+	// spawn fails. Without it, an `onCliEntryOverrideFailed` callback
+	// that synchronously cleared the pointer + a still-broken bundled
+	// runtime could loop the retry forever.
+	private overrideRetryInFlight = false;
 
 	// Latched once `shutdown()` / `dispose()` begin. Every `await` boundary
 	// in the lifecycle methods (`connect`, `restart`, `startOwnRuntime`)
@@ -378,34 +379,43 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 				this.manager.removeAllListeners("error");
 				this.manager = null;
 			}
-			// Rollback: a non-bundled runtime that fails to reach the
-			// ready-poll cutoff is broken; mark it bad before re-throwing
-			// so the next boot resolves to a previous good version.
 			const reason = err instanceof Error ? err.message : String(err);
-			this.demoteCurrentRuntimeIfNonBundled(reason);
+			// Rollback: a staged runtime that failed to come up before
+			// the ready-poll cutoff is broken. Notify the host (which
+			// clears the persistent pointer) and retry once with the
+			// bundled cli — same launch, no user action required. The
+			// `overrideRetryInFlight` latch ensures a still-broken
+			// bundled runtime can't loop us forever; a second failure
+			// (now without override) just propagates normally.
+			if (this.currentSpawnUsedOverride && !this.overrideRetryInFlight) {
+				this.currentSpawnUsedOverride = false;
+				this.overrideRetryInFlight = true;
+				try {
+					this.opts.onCliEntryOverrideFailed?.(reason);
+				} catch (cbErr) {
+					console.warn(
+						"[desktop] onCliEntryOverrideFailed threw:",
+						cbErr instanceof Error ? cbErr.message : cbErr,
+					);
+				}
+				console.warn(
+					`[desktop] Staged runtime spawn failed (${reason}). Falling back to bundled cli.`,
+				);
+				if (this.terminated) return;
+				try {
+					await this.startOwnRuntime();
+				} finally {
+					this.overrideRetryInFlight = false;
+				}
+				return;
+			}
+			this.currentSpawnUsedOverride = false;
 			// Suppress on terminated — caller (drain inside shutdown/dispose)
 			// already moved past the point where it cares about the spawn
 			// failure, and re-throwing would surface as an unhandled
 			// rejection on the abandoned promise.
 			if (this.terminated) return;
 			throw err;
-		}
-	}
-
-	/**
-	 * Boot-time runtime-store maintenance: sweep stale `*.partial` dirs.
-	 * Best-effort; failures are logged. No-op without `runtimeManagement`.
-	 */
-	async maintain(): Promise<void> {
-		const mgmt = this.opts.runtimeManagement;
-		if (!mgmt) return;
-		try {
-			mgmt.store.cleanupPartials();
-		} catch (err) {
-			console.warn(
-				"[desktop] runtime store cleanupPartials failed:",
-				err instanceof Error ? err.message : err,
-			);
 		}
 	}
 
@@ -437,57 +447,38 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	}
 
 	/**
-	 * Resolve which cli.js the shim should execute and capture the verdict
-	 * for this spawn. Returns `undefined` when there's no runtime store or
-	 * the bundled arm was picked (the shim finds that path itself).
+	 * Resolve which cli.js the shim should execute. Captures
+	 * `currentSpawnUsedOverride` so the failure path knows whether to
+	 * trigger same-launch fallback. Returns `undefined` (i.e. no env
+	 * override) when no callback is wired or it returned `null`, in
+	 * which case the shim finds bundled `cli.js` itself.
 	 */
 	private resolveCliEntryOverride(): string | undefined {
-		const mgmt = this.opts.runtimeManagement;
-		if (!mgmt) {
-			this.currentResolvedRuntime = null;
+		const resolver = this.opts.resolveCliEntryOverride;
+		if (!resolver) {
+			this.currentSpawnUsedOverride = false;
 			return undefined;
 		}
-		const resolved = resolveRuntime(mgmt);
-		this.currentResolvedRuntime = resolved;
-		if (resolved.source === "bundled") return undefined;
-		console.log(
-			`[desktop] Runtime resolver selected version=${resolved.version ?? "unknown"} source=${resolved.source} (pointer=${resolved.pointerVersion ?? "<none>"})`,
-		);
-		return resolved.cliEntryAbsolutePath;
-	}
-
-	/**
-	 * Mark the current spawn's runtime bad (non-bundled only) and emit
-	 * `runtime-rolled-back`. Failure-resilient — never throws so it can't
-	 * mask the original spawn error.
-	 */
-	private demoteCurrentRuntimeIfNonBundled(reason: string): void {
-		const resolved = this.currentResolvedRuntime;
-		this.currentResolvedRuntime = null;
-		if (!resolved || resolved.source === "bundled") return;
-		const mgmt = this.opts.runtimeManagement;
-		if (!mgmt) return;
-		const demoted = resolved.version;
-		if (!demoted) {
-			console.warn(
-				`[desktop] Runtime (${resolved.source}) failed: ${reason}. Skipping demote — resolved version is null.`,
-			);
-			return;
-		}
-		console.warn(
-			`[desktop] Runtime ${demoted} (${resolved.source}) failed: ${reason}. Marking bad and rolling back on next boot.`,
-		);
+		let override: string | null;
 		try {
-			// Mark the *resolved* version, not the pointer — fallback-arm
-			// spawns differ from the pointer.
-			mgmt.store.markBad(demoted);
+			override = resolver();
 		} catch (err) {
+			// Don't let a buggy resolver brick the whole spawn. Log and
+			// fall through to bundled.
 			console.warn(
-				"[desktop] markBad failed:",
+				"[desktop] resolveCliEntryOverride threw:",
 				err instanceof Error ? err.message : err,
 			);
+			this.currentSpawnUsedOverride = false;
+			return undefined;
 		}
-		this.emit("runtime-rolled-back", demoted);
+		if (!override) {
+			this.currentSpawnUsedOverride = false;
+			return undefined;
+		}
+		this.currentSpawnUsedOverride = true;
+		console.log(`[desktop] Runtime override → ${override}`);
+		return override;
 	}
 
 	private createManager(): RuntimeChildManager {

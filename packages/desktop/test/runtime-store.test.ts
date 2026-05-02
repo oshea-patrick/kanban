@@ -2,6 +2,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -10,119 +11,141 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createRuntimeStore, type RuntimeStore } from "../src/runtime-store.js";
+import {
+	cleanupPartials,
+	clearPointer,
+	partialDir,
+	readPointer,
+	versionDir,
+	writePointer,
+} from "../src/runtime-store.js";
 
-let root: string;
-let store: RuntimeStore;
+let userData: string;
 
 beforeEach(() => {
-	root = mkdtempSync(path.join(tmpdir(), "runtime-store-"));
-	store = createRuntimeStore(root);
+	userData = mkdtempSync(path.join(tmpdir(), "runtime-store-"));
 });
 
 afterEach(() => {
-	rmSync(root, { recursive: true, force: true });
+	rmSync(userData, { recursive: true, force: true });
 });
 
-/** Materialise a "finalized" runtime tree (the layout the resolver/installer expect). */
-function makeVersion(version: string): void {
-	mkdirSync(store.versionDir(version), { recursive: true });
-}
+const pointerPathFor = (root: string): string =>
+	path.join(root, "runtime-store", "current.json");
 
-describe("createRuntimeStore", () => {
-	it("readPointer returns null when missing or corrupt", () => {
-		expect(store.readPointer()).toBeNull();
-		mkdirSync(root, { recursive: true });
-		writeFileSync(store.pointerPath, "{not-json");
-		expect(store.readPointer()).toBeNull();
-	});
-
-	it("round-trips a pointer atomically (writes via tmp + rename)", () => {
-		makeVersion("0.1.66");
-		const pointer = {
-			version: "0.1.66",
-			installedAt: "2025-01-01T00:00:00.000Z",
-			cliEntry: "dist/cli.js",
-		};
-		store.writePointer(pointer);
-		expect(existsSync(`${store.pointerPath}.tmp`)).toBe(false); // tmp cleaned
-		expect(store.readPointer()).toEqual(pointer);
-	});
-
-	it("readPointer returns null when the version dir no longer exists", () => {
-		// Simulate post-rollback rmSync of the version tree (pointer is stale).
-		store.writePointer({
-			version: "9.9.9",
-			installedAt: "x",
-			cliEntry: "dist/cli.js",
-		});
-		expect(store.readPointer()).toBeNull();
-	});
-
-	it("readPointer rejects non-semver versions and missing fields", () => {
-		mkdirSync(root, { recursive: true });
-		writeFileSync(store.pointerPath, JSON.stringify({ version: "lol" }));
-		expect(store.readPointer()).toBeNull();
-	});
-
-	it("markBad / isBad", () => {
-		expect(store.isBad("0.1.66")).toBe(false);
-		store.markBad("0.1.66");
-		expect(store.isBad("0.1.66")).toBe(true);
-	});
-
-	it("listVersions returns finalized versions in semver-descending order, ignoring partial/bad/junk", () => {
-		makeVersion("0.1.0");
-		makeVersion("0.2.0");
-		makeVersion("0.10.0");
-		mkdirSync(store.partialDir("0.5.0"), { recursive: true });
-		mkdirSync(path.join(store.versionsDir, "not-a-version"), { recursive: true });
-		store.markBad("0.2.0"); // bad-marker is a sibling FILE, not a dir → still finalized
-
-		expect(store.listVersions()).toEqual(["0.10.0", "0.2.0", "0.1.0"]);
-	});
-
-	it("cleanupPartials removes only *.partial dirs", () => {
-		makeVersion("0.1.0");
-		mkdirSync(store.partialDir("0.5.0"), { recursive: true });
-		mkdirSync(store.partialDir("0.6.0"), { recursive: true });
-
-		store.cleanupPartials();
-
-		expect(existsSync(store.versionDir("0.1.0"))).toBe(true);
-		expect(existsSync(store.partialDir("0.5.0"))).toBe(false);
-		expect(existsSync(store.partialDir("0.6.0"))).toBe(false);
-	});
-
-	describe("finalize", () => {
-		it("renames partial → final atomically", () => {
-			const partial = store.partialDir("0.1.66");
-			mkdirSync(path.join(partial, "dist"), { recursive: true });
-			writeFileSync(path.join(partial, "dist", "cli.js"), "// runtime");
-
-			store.finalize("0.1.66");
-
-			expect(existsSync(partial)).toBe(false);
-			expect(existsSync(path.join(store.versionDir("0.1.66"), "dist", "cli.js"))).toBe(true);
+describe("runtime-store", () => {
+	describe("readPointer / writePointer", () => {
+		it("returns null when missing", () => {
+			expect(readPointer(userData)).toBeNull();
 		});
 
-		it("replaces an existing finalized tree (re-install of same version)", () => {
-			mkdirSync(store.versionDir("0.1.66"), { recursive: true });
-			writeFileSync(path.join(store.versionDir("0.1.66"), "stale.txt"), "old");
+		it("returns null when the file is corrupt JSON", () => {
+			mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
+			writeFileSync(pointerPathFor(userData), "{not-json");
+			expect(readPointer(userData)).toBeNull();
+		});
 
-			mkdirSync(path.join(store.partialDir("0.1.66"), "dist"), { recursive: true });
+		it("round-trips a pointer atomically (writes via tmp + rename)", () => {
+			const cliEntry = path.join(versionDir(userData, "0.1.66"), "dist", "cli.js");
+			mkdirSync(path.dirname(cliEntry), { recursive: true });
+			writeFileSync(cliEntry, "// runtime");
+
+			writePointer(userData, { version: "0.1.66", cliEntry });
+
+			// Tmp file is renamed away atomically — no `.tmp` siblings.
+			const dir = path.dirname(pointerPathFor(userData));
+			const leftoverTmp =
+				existsSync(dir) && readdirSync(dir).some((n) => n.endsWith(".tmp"));
+			expect(leftoverTmp).toBe(false);
+
+			expect(readPointer(userData)).toEqual({
+				version: "0.1.66",
+				cliEntry: path.resolve(cliEntry),
+			});
+		});
+
+		it("rejects pointers with non-safe version strings", () => {
+			mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
 			writeFileSync(
-				path.join(store.partialDir("0.1.66"), "dist", "cli.js"),
-				"// new",
+				pointerPathFor(userData),
+				JSON.stringify({
+					version: "../../../etc/passwd",
+					cliEntry: path.join(userData, "runtime-store", "x"),
+				}),
 			);
-			store.finalize("0.1.66");
-
-			expect(existsSync(path.join(store.versionDir("0.1.66"), "stale.txt"))).toBe(false);
-			expect(existsSync(path.join(store.versionDir("0.1.66"), "dist", "cli.js"))).toBe(true);
+			expect(readPointer(userData)).toBeNull();
 		});
 
-		it("throws if no partial exists", () => {
-			expect(() => store.finalize("0.1.66")).toThrow(/missing partial install/);
+		it("rejects cliEntry outside the runtime-store root (path-traversal defense)", () => {
+			// A hand-crafted pointer with a cliEntry pointing outside the
+			// store root — the guard in `readPointer` must reject it.
+			mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
+			writeFileSync(
+				pointerPathFor(userData),
+				JSON.stringify({
+					version: "1.0.0",
+					cliEntry: "/etc/passwd",
+				}),
+			);
+			expect(readPointer(userData)).toBeNull();
+		});
+
+		it("writePointer rejects an unsafe version segment up front", () => {
+			expect(() =>
+				writePointer(userData, {
+					version: "../../bad",
+					cliEntry: path.join(userData, "runtime-store", "x"),
+				}),
+			).toThrow(/unsafe version/);
+		});
+
+		it("writePointer rejects a cliEntry outside the store root", () => {
+			expect(() =>
+				writePointer(userData, {
+					version: "1.0.0",
+					cliEntry: "/etc/passwd",
+				}),
+			).toThrow(/must live inside/);
+		});
+	});
+
+	describe("clearPointer", () => {
+		it("removes the pointer file (and is a no-op when missing)", () => {
+			expect(() => clearPointer(userData)).not.toThrow();
+
+			const cliEntry = path.join(versionDir(userData, "0.1.0"), "dist", "cli.js");
+			mkdirSync(path.dirname(cliEntry), { recursive: true });
+			writeFileSync(cliEntry, "// noop");
+			writePointer(userData, { version: "0.1.0", cliEntry });
+			expect(readPointer(userData)).not.toBeNull();
+
+			clearPointer(userData);
+			expect(readPointer(userData)).toBeNull();
+		});
+	});
+
+	describe("cleanupPartials", () => {
+		it("removes only `*.partial` directories", () => {
+			mkdirSync(versionDir(userData, "0.1.0"), { recursive: true });
+			mkdirSync(partialDir(userData, "0.5.0"), { recursive: true });
+			mkdirSync(partialDir(userData, "0.6.0"), { recursive: true });
+
+			cleanupPartials(userData);
+
+			expect(existsSync(versionDir(userData, "0.1.0"))).toBe(true);
+			expect(existsSync(partialDir(userData, "0.5.0"))).toBe(false);
+			expect(existsSync(partialDir(userData, "0.6.0"))).toBe(false);
+		});
+
+		it("is a no-op when the versions root does not exist", () => {
+			expect(() => cleanupPartials(userData)).not.toThrow();
+		});
+	});
+
+	describe("versionDir / partialDir safety", () => {
+		it("rejects path-traversal version strings", () => {
+			expect(() => versionDir(userData, "../../etc")).toThrow(/unsafe version/);
+			expect(() => partialDir(userData, "../../etc")).toThrow(/unsafe version/);
 		});
 	});
 });

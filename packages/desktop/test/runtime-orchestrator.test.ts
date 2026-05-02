@@ -1,10 +1,5 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-import { createRuntimeStore, type RuntimeStore } from "../src/runtime-store.js";
 
 vi.mock("electron", () => ({
 	powerSaveBlocker: {
@@ -1841,88 +1836,116 @@ describe("RuntimeOrchestrator health-probe runtime identification", () => {
 });
 
 // ---------------------------------------------------------------------
-// Runtime-store maintenance + non-bundled rollback. Uses a real
-// runtime store against a tmpdir — mocking it would re-stub the very
-// contract we're trying to pin.
+// `cliEntryOverride` callback wiring + same-launch fallback. The host
+// owns runtime-store / staging concerns; the orchestrator just plumbs
+// a callback into RuntimeChildManager and signals back when a staged
+// spawn fails so the host can clear its persistent pointer.
 // ---------------------------------------------------------------------
-describe("RuntimeOrchestrator runtime-store maintenance + non-bundled rollback", () => {
-	let tmpRoot: string;
-	let store: RuntimeStore;
-	const bundledCliEntry = process.execPath; // any file that exists
-	const bundledVersion = "0.0.1";
-
-	/**
-	 * Lay out `versions/<v>/dist/cli.js` (the installer's canonical layout)
-	 * and point `current.json` at it.
-	 */
-	function stageInstalledRuntime(version: string): void {
-		const distDir = path.join(tmpRoot, "versions", version, "dist");
-		mkdirSync(distDir, { recursive: true });
-		writeFileSync(path.join(distDir, "cli.js"), "// noop\n");
-		store.writePointer({
-			version,
-			installedAt: new Date().toISOString(),
-			cliEntry: "dist/cli.js",
-		});
-	}
-
+describe("RuntimeOrchestrator cliEntryOverride wiring + fallback", () => {
 	beforeEach(() => {
-		tmpRoot = mkdtempSync(path.join(tmpdir(), "kanban-orch-rs-"));
-		store = createRuntimeStore(tmpRoot);
 		childManagers.length = 0;
+		FakeChildManager.lastConstructorOptions.length = 0;
+		FakeChildManager.nextStartError = null;
 	});
 
-	afterEach(() => {
-		rmSync(tmpRoot, { recursive: true, force: true });
-	});
+	it("forwards resolveCliEntryOverride() result into the child manager on every spawn", async () => {
+		// Returns a different override per call so we can verify the
+		// resolver is re-evaluated on each spawn (a freshly-staged runtime
+		// must take effect on the next restart, not be cached at construct
+		// time). Using an iterator instead of a counter so the resolver
+		// itself stays a pure value-producing function.
+		const overrides = ["/staged/v1/dist/cli.js", "/staged/v2/dist/cli.js"];
+		let i = 0;
+		const resolveCliEntryOverride = vi.fn(() => overrides[i++] ?? null);
 
-	it("maintain() is a no-op without runtimeManagement", async () => {
 		const orchestrator = new RuntimeOrchestrator({
 			host: "127.0.0.1",
 			port: 3484,
 			healthTimeoutMs: 500,
 			resolveCliShimPath: () => process.execPath,
-			fetchImpl: vi.fn() as unknown as typeof fetch,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			resolveCliEntryOverride,
 			attachedProbeIntervalMs: 0,
 			recoveryProbeIntervalMs: 0,
 		});
-		await expect(orchestrator.maintain()).resolves.toBeUndefined();
+
+		// First spawn — connect → startOwnRuntime → createManager.
+		await orchestrator.connect();
+		expect(resolveCliEntryOverride).toHaveBeenCalledTimes(1);
+		expect(
+			FakeChildManager.lastConstructorOptions.at(-1)?.cliEntryOverride,
+		).toBe("/staged/v1/dist/cli.js");
+
+		// Second spawn — restart() shuts the manager down and respawns,
+		// re-querying the resolver.
+		await orchestrator.restart();
+		expect(resolveCliEntryOverride).toHaveBeenCalledTimes(2);
+		expect(
+			FakeChildManager.lastConstructorOptions.at(-1)?.cliEntryOverride,
+		).toBe("/staged/v2/dist/cli.js");
+
+		await orchestrator.shutdown();
 	});
 
-	it("maintain() invokes store.cleanupPartials and swallows failures (boot must not crash)", async () => {
-		const cleanupSpy = vi.spyOn(store, "cleanupPartials");
+	it("passes undefined cliEntryOverride when resolveCliEntryOverride returns null (use bundled cli)", async () => {
 		const orchestrator = new RuntimeOrchestrator({
 			host: "127.0.0.1",
 			port: 3484,
 			healthTimeoutMs: 500,
 			resolveCliShimPath: () => process.execPath,
-			fetchImpl: vi.fn() as unknown as typeof fetch,
-			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			resolveCliEntryOverride: () => null,
 			attachedProbeIntervalMs: 0,
 			recoveryProbeIntervalMs: 0,
 		});
 
-		await orchestrator.maintain();
-		expect(cleanupSpy).toHaveBeenCalledTimes(1);
+		await orchestrator.connect();
+		expect(
+			FakeChildManager.lastConstructorOptions.at(-1)?.cliEntryOverride,
+		).toBeUndefined();
 
-		// One-shot failure: must not throw, must not abort boot.
-		cleanupSpy.mockImplementationOnce(() => {
-			throw new Error("simulated I/O failure");
-		});
-		await expect(orchestrator.maintain()).resolves.toBeUndefined();
-		expect(cleanupSpy).toHaveBeenCalledTimes(2);
+		await orchestrator.shutdown();
 	});
 
-	it("startup failure on a non-bundled resolved runtime marks the *resolved* version bad and emits runtime-rolled-back", async () => {
-		// Pointer is 0.99.1 (already bad); 0.99.0 is the best fallback.
-		// Spawn fails — orchestrator must mark 0.99.0 (the version it
-		// actually launched), not 0.99.1.
-		stageInstalledRuntime("0.99.0");
-		stageInstalledRuntime("0.99.1");
-		store.markBad("0.99.1");
+	it("passes undefined cliEntryOverride when no resolver is wired (dev / unmanaged)", async () => {
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
 
+		await orchestrator.connect();
+		expect(
+			FakeChildManager.lastConstructorOptions.at(-1)?.cliEntryOverride,
+		).toBeUndefined();
+
+		await orchestrator.shutdown();
+	});
+
+	it("on staged-spawn failure: invokes onCliEntryOverrideFailed and retries once with bundled cli", async () => {
+		// Spawn 1: resolver returns staged cli; FakeChildManager rejects.
+		// → onCliEntryOverrideFailed fires, orchestrator retries.
+		// Spawn 2: resolver returns null (host cleared the pointer);
+		// FakeChildManager succeeds.
+		const overrides: Array<string | null> = ["/staged/v1/dist/cli.js", null];
+		let i = 0;
+		const resolveCliEntryOverride = vi.fn(() => overrides[i++] ?? null);
+		const onCliEntryOverrideFailed = vi.fn();
+
+		// Single-shot failure on the first spawn — second spawn (bundled)
+		// resolves to the default URL.
 		FakeChildManager.nextStartError = new Error(
-			"runtime exited during startup: ENOENT cli.js",
+			"runtime exited during startup: ENOENT staged/cli.js",
 		);
 
 		const orchestrator = new RuntimeOrchestrator({
@@ -1933,70 +1956,130 @@ describe("RuntimeOrchestrator runtime-store maintenance + non-bundled rollback",
 			fetchImpl: vi.fn(async () =>
 				Promise.reject(new Error("ECONNREFUSED")),
 			) as unknown as typeof fetch,
-			runtimeManagement: { store, bundledCliEntry, bundledVersion },
+			resolveCliEntryOverride,
+			onCliEntryOverrideFailed,
 			attachedProbeIntervalMs: 0,
 			recoveryProbeIntervalMs: 0,
 		});
 
-		const rollbackEvents: Array<string | null> = [];
-		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
-
-		await expect(orchestrator.connect()).rejects.toThrow(/exited during startup/);
-
-		expect(rollbackEvents).toEqual(["0.99.0"]);
-		expect(store.isBad("0.99.0")).toBe(true);
-		expect(store.isBad("0.99.1")).toBe(true); // unchanged
-	});
-
-	it("does NOT mark bad when the failed spawn was using the bundled arm", async () => {
-		// No installed versions → resolver picks bundled. A startup
-		// failure here is a packaging issue; nothing to demote.
-		FakeChildManager.nextStartError = new Error("ENOENT bundled cli");
-
-		const orchestrator = new RuntimeOrchestrator({
-			host: "127.0.0.1",
-			port: 3484,
-			healthTimeoutMs: 500,
-			resolveCliShimPath: () => process.execPath,
-			fetchImpl: vi.fn(async () =>
-				Promise.reject(new Error("ECONNREFUSED")),
-			) as unknown as typeof fetch,
-			runtimeManagement: { store, bundledCliEntry, bundledVersion },
-			attachedProbeIntervalMs: 0,
-			recoveryProbeIntervalMs: 0,
-		});
-
-		const rollbackEvents: Array<string | null> = [];
-		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
-
-		await expect(orchestrator.connect()).rejects.toThrow(/ENOENT bundled cli/);
-		expect(rollbackEvents).toEqual([]);
-		expect(store.listVersions()).toEqual([]); // no bad markers written
-	});
-
-	it("does NOT mark bad on a successful spawn", async () => {
-		stageInstalledRuntime("0.99.0");
-
-		const orchestrator = new RuntimeOrchestrator({
-			host: "127.0.0.1",
-			port: 3484,
-			healthTimeoutMs: 500,
-			resolveCliShimPath: () => process.execPath,
-			fetchImpl: vi.fn(async () =>
-				Promise.reject(new Error("ECONNREFUSED")),
-			) as unknown as typeof fetch,
-			runtimeManagement: { store, bundledCliEntry, bundledVersion },
-			attachedProbeIntervalMs: 0,
-			recoveryProbeIntervalMs: 0,
-		});
-
-		const rollbackEvents: Array<string | null> = [];
-		orchestrator.on("runtime-rolled-back", (v) => rollbackEvents.push(v));
-
+		// connect() must succeed thanks to the same-launch retry, *not*
+		// reject — the user shouldn't see the failure.
 		await orchestrator.connect();
 		expect(orchestrator.isOwned()).toBe(true);
-		expect(rollbackEvents).toEqual([]);
-		expect(store.isBad("0.99.0")).toBe(false);
+		expect(orchestrator.getUrl()).toBe("http://127.0.0.1:3484");
+
+		expect(onCliEntryOverrideFailed).toHaveBeenCalledTimes(1);
+		expect(onCliEntryOverrideFailed.mock.calls[0]?.[0]).toMatch(
+			/ENOENT staged\/cli.js/,
+		);
+
+		// Two child managers were constructed — first staged (failed),
+		// second bundled (succeeded).
+		expect(FakeChildManager.lastConstructorOptions).toHaveLength(2);
+		expect(
+			FakeChildManager.lastConstructorOptions[0]?.cliEntryOverride,
+		).toBe("/staged/v1/dist/cli.js");
+		expect(
+			FakeChildManager.lastConstructorOptions[1]?.cliEntryOverride,
+		).toBeUndefined();
+
+		await orchestrator.shutdown();
+	});
+
+	it("does not loop forever if the bundled retry also fails (single retry only)", async () => {
+		// Both spawns fail. After the staged failure → callback → retry,
+		// the bundled spawn fails too — and that error propagates without
+		// triggering another callback or another retry.
+		const resolveCliEntryOverride = vi.fn(() => "/staged/v1/dist/cli.js");
+		const onCliEntryOverrideFailed = vi.fn();
+
+		// Make every FakeChildManager.start() call fail. Using a
+		// once-per-instance error setter doesn't compose cleanly across
+		// two manager instances, so spy directly on the prototype.
+		const startSpy = vi
+			.spyOn(FakeChildManager.prototype, "start")
+			.mockRejectedValue(new Error("spawn failed"));
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			resolveCliEntryOverride,
+			onCliEntryOverrideFailed,
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		await expect(orchestrator.connect()).rejects.toThrow(/spawn failed/);
+
+		// Callback fired exactly once for the staged failure; the bundled
+		// retry's failure does not re-enter the callback.
+		expect(onCliEntryOverrideFailed).toHaveBeenCalledTimes(1);
+		// Two spawn attempts total: staged + bundled retry.
+		expect(FakeChildManager.lastConstructorOptions).toHaveLength(2);
+
+		startSpy.mockRestore();
+	});
+
+	it("does not invoke onCliEntryOverrideFailed when a *bundled* spawn fails", async () => {
+		// No override → first spawn is bundled. Failure is a packaging
+		// issue, not a staged-runtime issue; the callback must not fire
+		// and the error propagates directly.
+		const resolveCliEntryOverride = vi.fn(() => null);
+		const onCliEntryOverrideFailed = vi.fn();
+
+		FakeChildManager.nextStartError = new Error(
+			"runtime exited during startup: ENOENT bundled/cli.js",
+		);
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			resolveCliEntryOverride,
+			onCliEntryOverrideFailed,
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		await expect(orchestrator.connect()).rejects.toThrow(/ENOENT bundled/);
+		expect(onCliEntryOverrideFailed).not.toHaveBeenCalled();
+		// Single spawn attempt — no retry.
+		expect(FakeChildManager.lastConstructorOptions).toHaveLength(1);
+	});
+
+	it("falls back to bundled when resolveCliEntryOverride throws (does not brick the spawn)", async () => {
+		const resolveCliEntryOverride = vi.fn(() => {
+			throw new Error("disk I/O");
+		});
+
+		const orchestrator = new RuntimeOrchestrator({
+			host: "127.0.0.1",
+			port: 3484,
+			healthTimeoutMs: 500,
+			resolveCliShimPath: () => process.execPath,
+			fetchImpl: vi.fn(async () =>
+				Promise.reject(new Error("ECONNREFUSED")),
+			) as unknown as typeof fetch,
+			resolveCliEntryOverride,
+			attachedProbeIntervalMs: 0,
+			recoveryProbeIntervalMs: 0,
+		});
+
+		// connect() succeeds with bundled.
+		await orchestrator.connect();
+		expect(orchestrator.isOwned()).toBe(true);
+		expect(
+			FakeChildManager.lastConstructorOptions.at(-1)?.cliEntryOverride,
+		).toBeUndefined();
 
 		await orchestrator.shutdown();
 	});

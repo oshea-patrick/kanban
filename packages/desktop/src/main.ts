@@ -1,5 +1,5 @@
 import { BrowserWindow, app, dialog, ipcMain } from "electron";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -10,13 +10,13 @@ import {
 	parseProtocolUrl,
 	registerProtocol,
 } from "./protocol-handler.js";
-import {
-	createRuntimeBackgroundUpdater,
-	type RuntimeBackgroundUpdater,
-} from "./runtime-background-updater.js";
-import type { RuntimeInstallerConfig } from "./runtime-installer.js";
 import { RuntimeOrchestrator } from "./runtime-orchestrator.js";
-import { createRuntimeStore, type RuntimeStore } from "./runtime-store.js";
+import {
+	cleanupPartials,
+	clearPointer,
+	readPointer,
+} from "./runtime-store.js";
+import { checkAndStageLatestRuntime } from "./runtime-update.js";
 import { WindowFactory } from "./window-factory.js";
 import { WindowRegistry } from "./window-registry.js";
 
@@ -42,65 +42,100 @@ let isQuitting = false;
 const registry = new WindowRegistry();
 
 /**
- * Channel-1 runtime store + resolver + updater. Packaged-only:
- *   - The bundled `app.asar.unpacked/cli/cli.js` path doesn't exist
- *     in dev (dev uses the `kanban-dev` shim against `dist/cli.js`).
+ * Runtime-update wiring. Packaged-only:
+ *   - The bundled `app.asar.unpacked/cli/cli.js` path doesn't exist in
+ *     dev (dev uses the `kanban-dev` shim against `dist/cli.js`).
  *   - A dev-side store under `~/Library/Application Support/Kanban/`
  *     would hijack subsequent packaged-app launches ("ghost upgrade").
- * In dev the orchestrator sees no resolver and the existing spawn
- * path is unchanged.
+ * In dev `runtimeUpdate` is `null` and the orchestrator just spawns
+ * the bundled cli.
  */
-const runtimeManagement = buildRuntimeManagement();
+interface RuntimeUpdateConfig {
+	userData: string;
+	bundledVersion: string;
+	nativeDepsSource: string;
+}
+
+function buildRuntimeUpdateConfig(): RuntimeUpdateConfig | null {
+	if (!app.isPackaged) return null;
+	// `process.resourcesPath` is `Kanban.app/Contents/Resources` on macOS
+	// and `kanban/resources` on Linux; both layouts have
+	// `app.asar.unpacked/` carved out per the `asarUnpack` rule.
+	const unpacked = path.join(process.resourcesPath, "app.asar.unpacked");
+	const bundledCliDir = path.join(unpacked, "cli");
+	return {
+		userData: app.getPath("userData"),
+		bundledVersion: readBundledRuntimeVersion(bundledCliDir),
+		// `node-pty` lives under `app.asar.unpacked/node_modules/` after
+		// `electron-builder install-app-deps` rebuilds it against the
+		// bundled Electron ABI. Each staged version copies it into its
+		// own `node_modules/` so updates launch without a native rebuild.
+		nativeDepsSource: path.join(unpacked, "node_modules"),
+	};
+}
+
+const runtimeUpdate = buildRuntimeUpdateConfig();
+
+// Sweep stale `<v>.partial/` dirs left behind by an extract that was
+// killed by a quit/crash. Runs *before* `connect()` so a partial dir
+// can't collide with a fresh extract on the next tick. Best-effort.
+if (runtimeUpdate) {
+	try {
+		cleanupPartials(runtimeUpdate.userData);
+	} catch (err) {
+		console.warn(
+			"[desktop] cleanupPartials failed:",
+			err instanceof Error ? err.message : err,
+		);
+	}
+}
+
+/**
+ * Read the staged-runtime pointer and verify the `cliEntry` exists on
+ * disk. `null` means "use bundled cli". Runs on every spawn — a freshly
+ * staged version takes effect on the next restart.
+ */
+function loadStagedCliOverride(userData: string): string | null {
+	const pointer = readPointer(userData);
+	if (!pointer) return null;
+	if (!existsSync(pointer.cliEntry)) {
+		console.warn(
+			`[desktop] Staged runtime cliEntry missing (${pointer.cliEntry}); falling back to bundled.`,
+		);
+		return null;
+	}
+	return pointer.cliEntry;
+}
 
 const orchestrator = new RuntimeOrchestrator({
 	host: DEFAULT_HOST,
 	port: DEFAULT_PORT,
 	healthTimeoutMs: HEALTH_TIMEOUT_MS,
 	resolveCliShimPath,
-	runtimeManagement: runtimeManagement
-		? {
-				store: runtimeManagement.store,
-				bundledCliEntry: runtimeManagement.bundledCliEntry,
-				bundledVersion: runtimeManagement.bundledVersion,
+	resolveCliEntryOverride: runtimeUpdate
+		? () => loadStagedCliOverride(runtimeUpdate.userData)
+		: undefined,
+	onCliEntryOverrideFailed: runtimeUpdate
+		? (reason) => {
+				// Staged runtime failed its readiness probe — drop the
+				// pointer so this and subsequent launches both fall back
+				// to bundled. The orchestrator immediately retries this
+				// same launch with the bundled cli.
+				console.warn(
+					`[desktop] Staged runtime failed (${reason}); clearing pointer.`,
+				);
+				try {
+					clearPointer(runtimeUpdate.userData);
+				} catch (err) {
+					console.warn(
+						"[desktop] clearPointer failed:",
+						err instanceof Error ? err.message : err,
+					);
+				}
+				broadcastToAllRenderers("runtime:rolled-back", null);
 			}
-		: null,
+		: undefined,
 });
-
-interface RuntimeManagement {
-	store: RuntimeStore;
-	installerConfig: RuntimeInstallerConfig;
-	bundledCliEntry: string;
-	bundledVersion: string;
-}
-
-function buildRuntimeManagement(): RuntimeManagement | null {
-	if (!app.isPackaged) return null;
-
-	// `process.resourcesPath` is `Kanban.app/Contents/Resources` on macOS
-	// and `kanban/resources` on Linux; both layouts have `app.asar.unpacked/`
-	// carved out per the `asarUnpack` rule.
-	const unpacked = path.join(process.resourcesPath, "app.asar.unpacked");
-	const bundledCliDir = path.join(unpacked, "cli");
-	const bundledCliEntry = path.join(bundledCliDir, "cli.js");
-
-	// `app.getVersion()` returns the desktop SHELL version (packages/desktop/
-	// package.json — currently 0.0.1), not the runtime CLI version. The
-	// `stage:cli` script writes `{ type: "module", version }` next to the
-	// staged cli.js using the root package.json version (the runtime).
-	const bundledVersion = readBundledRuntimeVersion(bundledCliDir);
-
-	const store = createRuntimeStore(path.join(app.getPath("userData"), "runtime-store"));
-	const installerConfig: RuntimeInstallerConfig = {
-		store,
-		// `node-pty` lives under `app.asar.unpacked/node_modules/` after
-		// `electron-builder install-app-deps` rebuilds it against the bundled
-		// Electron ABI. Each staged version copies it into its own
-		// `node_modules/` so updates launch without a native rebuild.
-		nativeDepsSource: path.join(unpacked, "node_modules"),
-	};
-
-	return { store, installerConfig, bundledCliEntry, bundledVersion };
-}
 
 function readBundledRuntimeVersion(bundledCliDir: string): string {
 	try {
@@ -183,13 +218,6 @@ function broadcastToAllRenderers(channel: string, ...args: unknown[]): void {
 		}
 	}
 }
-
-orchestrator.on("runtime-rolled-back", (demoted) => {
-	console.warn(
-		`[desktop] Runtime rolled back (demoted=${demoted ?? "unknown"})`,
-	);
-	broadcastToAllRenderers("runtime:rolled-back", demoted);
-});
 
 function handleProtocolUrl(raw: string): void {
 	const parsed = parseProtocolUrl(raw);
@@ -315,10 +343,48 @@ if (!gotTheLock) {
 	wireAppLifecycle();
 }
 
-// Background runtime updater — built lazily after `orchestrator.connect()`
-// and disposed in `before-quit`. Lives at module scope so the shutdown
-// handler can reach it.
-let backgroundUpdater: RuntimeBackgroundUpdater | null = null;
+// Runtime-update timers. Module-scoped so `before-quit` can clear them.
+// `null` while idle (dev, or before `whenReady` fires).
+let runtimeUpdateFirstTimer: NodeJS.Timeout | null = null;
+let runtimeUpdateInterval: NodeJS.Timeout | null = null;
+let runtimeUpdateInFlight = false;
+
+const FIRST_UPDATE_CHECK_DELAY_MS = 30_000;
+const UPDATE_CHECK_INTERVAL_MS = 30 * 60_000;
+
+async function runRuntimeUpdateCheck(cfg: RuntimeUpdateConfig): Promise<void> {
+	// Single-flight: a slow extract racing the periodic interval would
+	// otherwise re-enter and start a duplicate `pacote.extract` into the
+	// same `<v>.partial/`, fail the second one, and leave the registry
+	// poll counted twice.
+	if (runtimeUpdateInFlight) return;
+	runtimeUpdateInFlight = true;
+	try {
+		const result = await checkAndStageLatestRuntime({
+			userData: cfg.userData,
+			// Pointer version if a previous tick already staged a newer
+			// runtime; bundled otherwise (fresh install / post-rollback).
+			currentVersion: readPointer(cfg.userData)?.version ?? cfg.bundledVersion,
+			nativeDepsSource: cfg.nativeDepsSource,
+		});
+		if (result) {
+			console.log(
+				`[desktop] Staged kanban@${result.stagedVersion} — restart to apply.`,
+			);
+			broadcastToAllRenderers("runtime:update-staged", result.stagedVersion);
+		}
+	} catch (err) {
+		// Network errors, registry hiccups, missing native deps — log
+		// and try again on the next tick. The pointer is intentionally
+		// untouched on any failure.
+		console.warn(
+			"[desktop] Runtime update check failed:",
+			err instanceof Error ? err.message : err,
+		);
+	} finally {
+		runtimeUpdateInFlight = false;
+	}
+}
 
 function wireAppLifecycle(): void {
 	app.whenReady().then(async () => {
@@ -359,13 +425,6 @@ function wireAppLifecycle(): void {
 			}
 		});
 
-		// Best-effort store maintenance: cleanupPartials + pruneVersions.
-		// Runs *before* connect() so any post-rollback debris (a partial
-		// dir from a download interrupted at the last quit) is gone before
-		// we resolve which version to spawn. `maintain()` swallows its
-		// own errors; never blocks startup.
-		await orchestrator.maintain();
-
 		try {
 			await orchestrator.connect();
 		} catch (error) {
@@ -384,27 +443,21 @@ function wireAppLifecycle(): void {
 			windowFactory.showDisconnectedScreen();
 		}
 
-		// Start the runtime background updater after connect — the 30s
-		// firstCheckDelayMs keeps it out of the boot-spike window, and
-		// starting post-connect avoids hammering the registry while the
-		// user's on the disconnected screen.
-		if (runtimeManagement) {
-			const { store, installerConfig, bundledVersion } = runtimeManagement;
-			backgroundUpdater = createRuntimeBackgroundUpdater({
-				store,
-				installerConfig,
-				// Pointer version if rolled-forward, else bundled (fresh
-				// install or post-rollback fallback).
-				getCurrentVersion: () =>
-					store.readPointer()?.version ?? bundledVersion,
-				onStaged: (version) => {
-					console.log(
-						`[desktop] Runtime ${version} staged — broadcasting restart prompt.`,
-					);
-					broadcastToAllRenderers("runtime:update-staged", version);
-				},
-			});
-			backgroundUpdater.start();
+		// Schedule background runtime checks after connect. The 30s
+		// initial delay keeps the registry call out of the boot-spike
+		// window; the 30min interval handles long-lived sessions. Both
+		// timers `.unref()`'d so they don't keep the event loop alive at
+		// quit. Packaged-only — `runtimeUpdate` is `null` in dev.
+		if (runtimeUpdate) {
+			const cfg = runtimeUpdate;
+			runtimeUpdateFirstTimer = setTimeout(() => {
+				void runRuntimeUpdateCheck(cfg);
+			}, FIRST_UPDATE_CHECK_DELAY_MS);
+			runtimeUpdateFirstTimer.unref();
+			runtimeUpdateInterval = setInterval(() => {
+				void runRuntimeUpdateCheck(cfg);
+			}, UPDATE_CHECK_INTERVAL_MS);
+			runtimeUpdateInterval.unref();
 		}
 	});
 
@@ -428,13 +481,18 @@ function wireAppLifecycle(): void {
 		// kill any post-teardown spawn.
 		event.preventDefault();
 		try {
-			// Dispose the background updater before orchestrator.shutdown()
-			// so any in-flight install settles (avoids a half-staged
-			// version) while no new check fires during runtime teardown.
-			// The 5s internal checker timeout bounds the await.
-			if (backgroundUpdater) {
-				await backgroundUpdater.dispose();
-				backgroundUpdater = null;
+			// Stop background update timers before orchestrator.shutdown()
+			// so a check doesn't fire mid-teardown. Any extract that's
+			// already past `pacote.extract` will finish cleanly and write
+			// the pointer; one earlier than that gets dropped — its
+			// `<v>.partial/` will be swept on the next boot.
+			if (runtimeUpdateFirstTimer) {
+				clearTimeout(runtimeUpdateFirstTimer);
+				runtimeUpdateFirstTimer = null;
+			}
+			if (runtimeUpdateInterval) {
+				clearInterval(runtimeUpdateInterval);
+				runtimeUpdateInterval = null;
 			}
 			await orchestrator.shutdown();
 		} catch (err) {
