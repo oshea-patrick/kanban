@@ -1,5 +1,5 @@
 import { BrowserWindow, app, dialog, ipcMain } from "electron";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -14,7 +14,10 @@ import { RuntimeOrchestrator } from "./runtime-orchestrator.js";
 import {
 	cleanupPartials,
 	clearPointer,
+	markBadVersion,
 	readPointer,
+	removeVersionDir,
+	resolvePointerCliEntry,
 } from "./runtime-store.js";
 import { checkAndStageLatestRuntime } from "./runtime-update.js";
 import { WindowFactory } from "./window-factory.js";
@@ -91,20 +94,47 @@ if (runtimeUpdate) {
 }
 
 /**
- * Read the staged-runtime pointer and verify the `cliEntry` exists on
- * disk. `null` means "use bundled cli". Runs on every spawn — a freshly
- * staged version takes effect on the next restart.
+ * Read the staged-runtime pointer and return the `cliEntry` *only* if
+ * it actually exists on disk. `null` means "use bundled cli". Runs on
+ * every spawn — a freshly staged version takes effect on the next
+ * restart.
+ *
+ * Self-repair: if the pointer exists but its `cliEntry` is missing
+ * (user wiped `~/Library/Application Support/.../runtime-store/`,
+ * filesystem corruption, leftover from an aborted update), we clear
+ * the pointer here. Without this, `runRuntimeUpdateCheck` would
+ * forever read the stale pointer's version as `currentVersion` and
+ * skip staging when `latest === pointer.version`, permanently
+ * suppressing updates.
+ *
+ * Note: rollback semantics. We only clear/mark-bad on *startup-probe*
+ * failure (orchestrator's `onCliEntryOverrideFailed`). A runtime that
+ * passes startup and then crashes later is treated as a transient
+ * crash, not a versioning issue — recovery probe + user-driven restart
+ * handle it. The pointer survives.
  */
 function loadStagedCliOverride(userData: string): string | null {
-	const pointer = readPointer(userData);
-	if (!pointer) return null;
-	if (!existsSync(pointer.cliEntry)) {
+	const cliEntry = resolvePointerCliEntry(userData);
+	if (cliEntry) return cliEntry;
+	if (readPointer(userData)) {
+		// Pointer exists but `cliEntry` is missing on disk. Self-repair
+		// so the background updater isn't permanently silenced by a
+		// stale pointer. Best-effort — if the unlink itself fails, the
+		// updater path tolerates a stale pointer (defends with
+		// `semver.valid(opts.currentVersion)` upstream).
 		console.warn(
-			`[desktop] Staged runtime cliEntry missing (${pointer.cliEntry}); falling back to bundled.`,
+			`[desktop] Staged runtime cliEntry missing — clearing pointer to self-repair.`,
 		);
-		return null;
+		try {
+			clearPointer(userData);
+		} catch (err) {
+			console.warn(
+				"[desktop] clearPointer failed during self-repair:",
+				err instanceof Error ? err.message : err,
+			);
+		}
 	}
-	return pointer.cliEntry;
+	return null;
 }
 
 const orchestrator = new RuntimeOrchestrator({
@@ -117,22 +147,50 @@ const orchestrator = new RuntimeOrchestrator({
 		: undefined,
 	onCliEntryOverrideFailed: runtimeUpdate
 		? (reason) => {
-				// Staged runtime failed its readiness probe — drop the
-				// pointer so this and subsequent launches both fall back
-				// to bundled. The orchestrator immediately retries this
-				// same launch with the bundled cli.
+				// Staged runtime failed its readiness probe — mark the
+				// version bad so the background updater stops re-staging
+				// it (otherwise we'd re-download/re-prompt every 30 min
+				// for an incompatible `kanban@latest`), drop the pointer
+				// so this and subsequent launches both fall back to
+				// bundled, and remove the bad version dir to reclaim
+				// disk. The orchestrator immediately retries this same
+				// launch with the bundled cli.
+				const cfg = runtimeUpdate;
+				const failed = readPointer(cfg.userData);
 				console.warn(
-					`[desktop] Staged runtime failed (${reason}); clearing pointer.`,
+					`[desktop] Staged runtime failed (${reason}); rolling back${
+						failed ? ` ${failed.version}` : ""
+					}.`,
 				);
 				try {
-					clearPointer(runtimeUpdate.userData);
+					if (failed) {
+						markBadVersion(cfg.userData, failed.version, cfg.bundledVersion);
+					}
+				} catch (err) {
+					console.warn(
+						"[desktop] markBadVersion failed:",
+						err instanceof Error ? err.message : err,
+					);
+				}
+				try {
+					clearPointer(cfg.userData);
 				} catch (err) {
 					console.warn(
 						"[desktop] clearPointer failed:",
 						err instanceof Error ? err.message : err,
 					);
 				}
-				broadcastToAllRenderers("runtime:rolled-back", null);
+				if (failed) {
+					try {
+						removeVersionDir(cfg.userData, failed.version);
+					} catch (err) {
+						console.warn(
+							"[desktop] removeVersionDir failed:",
+							err instanceof Error ? err.message : err,
+						);
+					}
+				}
+				broadcastToAllRenderers("runtime:rolled-back", failed?.version ?? null);
 			}
 		: undefined,
 });
@@ -360,18 +418,42 @@ async function runRuntimeUpdateCheck(cfg: RuntimeUpdateConfig): Promise<void> {
 	if (runtimeUpdateInFlight) return;
 	runtimeUpdateInFlight = true;
 	try {
-		const result = await checkAndStageLatestRuntime({
+		// `currentVersion` resolution: prefer a pointer that still has a
+		// real `cliEntry` on disk; otherwise drop the pointer (so a
+		// broken pointer can't permanently freeze the version gate) and
+		// fall back to bundled. `loadStagedCliOverride` already does
+		// this self-repair on the orchestrator hot-path; we mirror it
+		// here so the *background* updater agrees with the *spawn*
+		// updater on what version we'd actually launch right now.
+		const currentVersion =
+			loadStagedCliOverride(cfg.userData) === null
+				? cfg.bundledVersion
+				: (readPointer(cfg.userData)?.version ?? cfg.bundledVersion);
+
+		const outcome = await checkAndStageLatestRuntime({
 			userData: cfg.userData,
-			// Pointer version if a previous tick already staged a newer
-			// runtime; bundled otherwise (fresh install / post-rollback).
-			currentVersion: readPointer(cfg.userData)?.version ?? cfg.bundledVersion,
+			currentVersion,
 			nativeDepsSource: cfg.nativeDepsSource,
+			// Electron's bundled node — what would actually execute the
+			// staged runtime. Used to skip versions whose `engines.node`
+			// outgrew this shell.
+			nodeVersion: process.versions.node,
 		});
-		if (result) {
+		if (outcome.kind === "staged") {
 			console.log(
-				`[desktop] Staged kanban@${result.stagedVersion} — restart to apply.`,
+				`[desktop] Staged kanban@${outcome.stagedVersion} — restart to apply.`,
 			);
-			broadcastToAllRenderers("runtime:update-staged", result.stagedVersion);
+			broadcastToAllRenderers("runtime:update-staged", outcome.stagedVersion);
+		} else if (outcome.kind === "engines-incompatible") {
+			// One-shot warning per cycle — useful in logs to explain why
+			// the user isn't getting offered an update they see on npm.
+			console.log(
+				`[desktop] Skipping kanban@${outcome.version}: engines.node ${outcome.required} not satisfied by Electron node ${process.versions.node}.`,
+			);
+		} else if (outcome.kind === "bad-version") {
+			console.log(
+				`[desktop] Skipping kanban@${outcome.version}: previously failed startup on this shell.`,
+			);
 		}
 	} catch (err) {
 		// Network errors, registry hiccups, missing native deps — log

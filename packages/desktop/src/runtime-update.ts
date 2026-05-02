@@ -5,24 +5,38 @@
  *
  * Flow:
  *   1. Ask the npm registry for `kanban@latest` (pacote.manifest)
- *   2. Skip if the active version (or already-staged pointer) is up
- *      to date
- *   3. `pacote.extract` the tarball into `versions/<v>.partial/`
- *   4. Copy bundled `node-pty` into the partial — published `kanban`
+ *   2. Skip if the active version is already up to date
+ *   3. Skip if `latest` is on the bad-versions list (a previous launch
+ *      already staged it and it failed startup; see `runtime-store`)
+ *   4. Skip if `manifest.engines.node` is unsatisfied by the running
+ *      Electron's bundled node (a runtime we couldn't run anyway)
+ *   5. `pacote.extract` the tarball into `versions/<v>.partial/`
+ *   6. Copy bundled `node-pty` into the partial — published `kanban`
  *      lists `node-pty` as a runtime dep, but a freshly-pacote-extracted
  *      tarball contains no `node_modules/`. Reusing the desktop's
  *      bundled `node-pty` (already-prebuilt for this Electron's ABI)
  *      avoids needing system `npm` at runtime
- *   5. Verify `dist/cli.js` exists in the partial
- *   6. Atomically rename partial → version dir
- *   7. Atomically write the pointer
+ *   7. Verify `dist/cli.js` exists in the partial
+ *   8. Atomically rename partial → version dir
+ *   9. Atomically write the pointer
  *
- * Failures at any step before step 7 leave the existing pointer
+ * Failures at any step before step 9 leave the existing pointer
  * untouched. The bundled runtime remains the fallback.
  *
+ * Compatibility note: the engines.node check is a *coarse* gate. It
+ * catches "newer node major than this Electron embeds", which is the
+ * realistic incompatibility today. It does NOT catch native ABI breaks
+ * in the bundled `node-pty` we copy in (those would surface as a
+ * startup failure → `onCliEntryOverrideFailed` → `markBadVersion`),
+ * nor does it catch new runtime deps the shell didn't bundle (same
+ * fallback path). Both are recoverable; the user just sees one prompt
+ * to restart and then the bad-versions list keeps the bad runtime out
+ * until upstream ships a fix.
+ *
  * No EventEmitter, no lifecycle class, no discriminated union of
- * outcomes — callers get either a `{ stagedVersion }` on success or a
- * thrown `Error` on failure (logged + swallowed at the call site).
+ * outcomes — callers get either a `{ stagedVersion }` on success, a
+ * `{ skippedReason }` on a benign skip, or a thrown `Error` on failure
+ * (logged + swallowed at the call site).
  */
 
 import { existsSync } from "node:fs";
@@ -34,6 +48,7 @@ import semver from "semver";
 
 import {
 	cleanupPartials,
+	isBadVersion,
 	partialDir,
 	readPointer,
 	versionDir,
@@ -56,15 +71,28 @@ export interface CheckOptions {
 	 * `node-pty/` from here into the staged runtime.
 	 */
 	nativeDepsSource: string;
+	/**
+	 * Node version of the *runtime that will execute the staged cli*.
+	 * In the desktop shell this is `process.versions.node` (Electron's
+	 * embedded node). Compared against the npm package's
+	 * `engines.node`; if unsatisfied, staging is skipped with reason
+	 * "engines-incompatible".
+	 *
+	 * Optional only so unit tests can opt out of the gate.
+	 */
+	nodeVersion?: string;
 }
 
-export interface StageResult {
-	stagedVersion: string;
-}
+export type StageOutcome =
+	| { kind: "staged"; stagedVersion: string }
+	| { kind: "up-to-date" }
+	| { kind: "already-staged" }
+	| { kind: "bad-version"; version: string }
+	| { kind: "engines-incompatible"; version: string; required: string };
 
 export async function checkAndStageLatestRuntime(
 	opts: CheckOptions,
-): Promise<StageResult | null> {
+): Promise<StageOutcome> {
 	const manifest = await pacote.manifest(`${PACKAGE_NAME}@latest`);
 	const latest = manifest.version;
 
@@ -74,13 +102,43 @@ export async function checkAndStageLatestRuntime(
 		);
 	}
 
-	// Already on (or past) latest — nothing to do.
-	if (!semver.gt(latest, opts.currentVersion)) return null;
+	// Already on (or past) latest — nothing to do. `currentVersion`
+	// might come from a stale/invalid pointer (caller clears those
+	// up-front), but defend anyway: a non-semver currentVersion would
+	// otherwise break the comparison.
+	if (semver.valid(opts.currentVersion) && !semver.gt(latest, opts.currentVersion)) {
+		return { kind: "up-to-date" };
+	}
+
+	// Don't re-stage a version that already failed startup. The
+	// bad-versions list self-empties as soon as upstream publishes a
+	// newer version, so this is a *temporary* skip per failed version.
+	if (isBadVersion(opts.userData, latest)) {
+		return { kind: "bad-version", version: latest };
+	}
+
+	// engines.node gate. The published kanban package declares e.g.
+	// `engines.node >= 22`; if the bundled Electron node is older, the
+	// staged runtime would crash on first import. Skip rather than
+	// stage-then-rollback (rollback works, but spends bandwidth and
+	// burns one cycle of the user's restart prompt).
+	const requiredNode = manifest.engines?.node;
+	if (
+		requiredNode &&
+		opts.nodeVersion &&
+		!semver.satisfies(opts.nodeVersion, requiredNode, { includePrerelease: true })
+	) {
+		return {
+			kind: "engines-incompatible",
+			version: latest,
+			required: requiredNode,
+		};
+	}
 
 	// Pointer already targets this version — a previous tick staged
 	// it; the shell will pick it up at next launch. Don't re-extract.
 	const pointer = readPointer(opts.userData);
-	if (pointer?.version === latest) return null;
+	if (pointer?.version === latest) return { kind: "already-staged" };
 
 	// Sweep stale partials from prior interrupted runs *before* we
 	// extract — an existing `<v>.partial/` would otherwise collide.
@@ -133,5 +191,5 @@ export async function checkAndStageLatestRuntime(
 		cliEntry: path.join(finalDir, "dist", "cli.js"),
 	});
 
-	return { stagedVersion: latest };
+	return { kind: "staged", stagedVersion: latest };
 }
