@@ -70,7 +70,7 @@ export async function checkAndStageLatestRuntime(
 	// returning null *and* the updater keeps short-circuiting on
 	// "already-staged" forever.
 	const stagedCli = resolvePointerCliEntry(opts.userData);
-	if (stagedCli && versionFromCliEntry(stagedCli) === latest) {
+	if (stagedCli && versionFromCliEntry(opts.userData, stagedCli) === latest) {
 		return { kind: "already-staged" };
 	}
 

@@ -60,16 +60,27 @@ export function cliEntryFor(userData: string, version: string): string {
 
 /**
  * Inverse of `cliEntryFor`. Walks back from a canonical cliEntry to
- * its `<v>` segment. Returns `null` if the path doesn't fit the
- * `versions/<v>/dist/cli.js` shape or `<v>` isn't valid semver.
+ * its `<v>` segment. Returns `null` unless the full path fits the
+ * `<userData>/runtime-store/versions/<v>/dist/cli.js` shape AND
+ * `<v>` is valid semver — checked by re-deriving via `cliEntryFor`
+ * and string-comparing. Validating the full shape (not just the
+ * `<v>` segment) means a stray path like `/tmp/1.2.3/dist/not-cli.js`
+ * or `/elsewhere/1.2.3/dist/cli.js` doesn't accidentally produce
+ * `"1.2.3"`, which would let the rollback path mark a real-but-
+ * unrelated version bad and remove its on-disk dir.
  *
  * Callers that capture the override path at spawn time use this to
  * roll back the version that *actually* ran — without re-reading the
  * pointer (which a concurrent background stage may have replaced).
  */
-export function versionFromCliEntry(cliEntry: string): string | null {
+export function versionFromCliEntry(
+	userData: string,
+	cliEntry: string,
+): string | null {
+	if (!path.isAbsolute(cliEntry)) return null;
 	const v = path.basename(path.dirname(path.dirname(cliEntry)));
-	return isSemver(v) ? v : null;
+	if (!isSemver(v)) return null;
+	return cliEntry === cliEntryFor(userData, v) ? v : null;
 }
 
 function atomicWrite(target: string, body: string): void {
@@ -124,8 +135,14 @@ export function writePointer(userData: string, p: RuntimePointer): void {
 	if (!isSemver(p.version)) {
 		throw new Error(`runtime-store: invalid semver: ${p.version}`);
 	}
+	// Symmetric with `readPointer`'s absolute-path contract — a relative
+	// `cliEntry` that happens to resolve to the canonical path from the
+	// caller's `process.cwd()` would round-trip through writer + reader
+	// today, but pointer validity must not depend on cwd at *either*
+	// boundary. Require absolute input here so the on-disk contract
+	// ("`cliEntry` is the canonical absolute path") is enforced uniformly.
 	const canonical = cliEntryFor(userData, p.version);
-	if (path.resolve(p.cliEntry) !== canonical) {
+	if (!path.isAbsolute(p.cliEntry) || p.cliEntry !== canonical) {
 		throw new Error(
 			`runtime-store: cliEntry for ${p.version} must be ${canonical}, got ${p.cliEntry}`,
 		);

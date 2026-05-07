@@ -23,6 +23,7 @@ import {
 	removeVersionDir,
 	resolvePointerCliEntry,
 	versionDir,
+	versionFromCliEntry,
 	writePointer,
 } from "../src/runtime-store.js";
 
@@ -124,12 +125,81 @@ describe("runtime-store: pointer", () => {
 		).toThrow(/cliEntry for 1\.0\.0 must be/);
 	});
 
+	it("writePointer rejects a relative cliEntry (symmetric with readPointer)", () => {
+		// Even if the relative form would resolve to the canonical path
+		// from the current cwd, accepting it would let pointer validity
+		// depend on `process.cwd()` at write time. The on-disk contract
+		// is "absolute canonical path" at both boundaries.
+		const canonical = cliEntryFor(userData, "1.0.0");
+		const relative = path.relative(process.cwd(), canonical);
+		expect(() =>
+			writePointer(userData, { version: "1.0.0", cliEntry: relative }),
+		).toThrow(/cliEntry for 1\.0\.0 must be/);
+	});
+
 	it("clearPointer is a no-op when missing and removes when present", () => {
 		expect(() => clearPointer(userData)).not.toThrow();
 		const cliEntry = stageVersion(userData, "0.1.0");
 		writePointer(userData, { version: "0.1.0", cliEntry });
 		clearPointer(userData);
 		expect(readPointer(userData)).toBeNull();
+	});
+});
+
+describe("runtime-store: versionFromCliEntry", () => {
+	it("extracts the version from a canonical cliEntry", () => {
+		const cli = cliEntryFor(userData, "1.2.3");
+		expect(versionFromCliEntry(userData, cli)).toBe("1.2.3");
+	});
+
+	it("returns null for a relative cliEntry", () => {
+		expect(versionFromCliEntry(userData, "versions/1.2.3/dist/cli.js")).toBeNull();
+	});
+
+	it("returns null when the path's <v> segment isn't valid semver", () => {
+		const bogus = path.join(userData, "runtime-store", "versions", "abc", "dist", "cli.js");
+		expect(versionFromCliEntry(userData, bogus)).toBeNull();
+	});
+
+	it("returns null when the path-shape doesn't match `versions/<v>/dist/cli.js`", () => {
+		// Right `<v>` segment in the right *position* but wrong root or
+		// wrong leaf must not yield a version — otherwise the rollback
+		// path could mark a real-but-unrelated version bad and remove
+		// its on-disk dir, just because some stray path happened to have
+		// `<semver>/dist/cli.js` somewhere in it.
+
+		// Wrong leaf filename.
+		const wrongLeaf = path.join(
+			userData,
+			"runtime-store",
+			"versions",
+			"1.2.3",
+			"dist",
+			"not-cli.js",
+		);
+		expect(versionFromCliEntry(userData, wrongLeaf)).toBeNull();
+
+		// Right shape under the wrong root (different userData).
+		const wrongRoot = path.join(
+			"/elsewhere",
+			"runtime-store",
+			"versions",
+			"1.2.3",
+			"dist",
+			"cli.js",
+		);
+		expect(versionFromCliEntry(userData, wrongRoot)).toBeNull();
+
+		// `<v>` in the right *segment* position but the parent isn't `dist`.
+		const wrongParent = path.join(
+			userData,
+			"runtime-store",
+			"versions",
+			"1.2.3",
+			"build",
+			"cli.js",
+		);
+		expect(versionFromCliEntry(userData, wrongParent)).toBeNull();
 	});
 });
 

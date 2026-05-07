@@ -116,7 +116,7 @@ export function createRuntimeAutoUpdate(
 	// "whatever the pointer says now" would mark/remove the *new*
 	// version that hasn't even been tried yet.
 	const onFailed = (reason: string, cliEntry: string): void => {
-		const failedVersion = versionFromCliEntry(cliEntry);
+		const failedVersion = versionFromCliEntry(deps.userData, cliEntry);
 		const current = readPointer(deps.userData);
 		const pointerStillFailed =
 			current !== null && current.cliEntry === cliEntry;
