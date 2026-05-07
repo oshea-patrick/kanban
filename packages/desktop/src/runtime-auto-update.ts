@@ -14,9 +14,11 @@ import {
 	cleanupPartials,
 	clearPointer,
 	markBadVersion,
+	pointerFileExists,
 	readPointer,
 	removeVersionDir,
 	resolvePointerCliEntry,
+	versionFromCliEntry,
 } from "./runtime-store.js";
 import { checkAndStageLatestRuntime } from "./runtime-update.js";
 
@@ -25,7 +27,14 @@ const CHECK_INTERVAL_MS = 30 * 60_000;
 
 export interface RuntimeAutoUpdate {
 	resolveCliEntryOverride: () => string | null;
-	onCliEntryOverrideFailed: (reason: string) => void;
+	/**
+	 * `cliEntry` must be exactly the path returned by an earlier
+	 * `resolveCliEntryOverride()` call — i.e. captured at spawn time
+	 * by the orchestrator. We use it to roll back the version that
+	 * actually ran, even if a concurrent background stage has since
+	 * advanced the pointer to a newer version.
+	 */
+	onCliEntryOverrideFailed: (reason: string, cliEntry: string) => void;
 	scheduleChecks(): void;
 	stop(): void;
 }
@@ -72,13 +81,21 @@ export function createRuntimeAutoUpdate(
 	};
 
 	// Effective launch version is `max(pointer, bundled)`. A pointer
-	// at-or-below bundled is stale (e.g. user updated the shell while
+	// at-or-below bundled is stale (e.g. user upgraded the shell while
 	// userData still pointed at an older staged runtime); without this
 	// guard we'd keep launching the older runtime forever. Also
-	// self-repairs pointers whose `cliEntry` no longer exists.
+	// self-repairs pointers whose `cliEntry` no longer exists, and
+	// removes invalid `current.json` files (corrupt JSON, non-canonical
+	// path, non-absolute path) so they can't linger as renderer-visible
+	// state forever.
 	const loadOverride = (): string | null => {
 		const pointer = readPointer(deps.userData);
-		if (!pointer) return null;
+		if (!pointer) {
+			if (pointerFileExists(deps.userData)) {
+				dropPointer("Invalid current.json");
+			}
+			return null;
+		}
 		if (semver.lte(pointer.version, bundledVersion)) {
 			dropPointer(
 				`Staged ${pointer.version} <= bundled ${bundledVersion}`,
@@ -91,31 +108,48 @@ export function createRuntimeAutoUpdate(
 		return null;
 	};
 
-	const onFailed = (reason: string): void => {
-		const failed = readPointer(deps.userData);
+	// Rollback for the version that *actually ran* — derived from the
+	// captured cliEntry, not from re-reading the pointer. The orchestrator
+	// runs the readiness probe asynchronously after spawn; in the
+	// meantime, a background `runCheck()` may have completed a successful
+	// staging and replaced the pointer with a newer version. Rolling back
+	// "whatever the pointer says now" would mark/remove the *new*
+	// version that hasn't even been tried yet.
+	const onFailed = (reason: string, cliEntry: string): void => {
+		const failedVersion = versionFromCliEntry(cliEntry);
+		const current = readPointer(deps.userData);
+		const pointerStillFailed =
+			current !== null && current.cliEntry === cliEntry;
 		console.warn(
 			`[desktop] Staged runtime failed (${reason})${
-				failed ? `; rolling back ${failed.version}` : ""
-			}.`,
+				failedVersion ? `; rolling back ${failedVersion}` : ""
+			}${pointerStillFailed ? "" : " (pointer already advanced)"}.`,
 		);
-		if (failed) {
+		if (failedVersion) {
 			try {
-				markBadVersion(deps.userData, failed.version);
+				markBadVersion(deps.userData, failedVersion);
 			} catch (e) {
 				warn("markBadVersion", e);
 			}
 			try {
-				removeVersionDir(deps.userData, failed.version);
+				removeVersionDir(deps.userData, failedVersion);
 			} catch (e) {
 				warn("removeVersionDir", e);
 			}
 		}
-		try {
-			clearPointer(deps.userData);
-		} catch (e) {
-			warn("clearPointer", e);
+		// Only clear the pointer if it still references the failed
+		// version. If a background stage already replaced it with a
+		// newer version, that version is presumed-good until proven
+		// otherwise — don't drop a healthy successor pointer because of
+		// a probe failure on a now-orphaned older spawn.
+		if (pointerStillFailed) {
+			try {
+				clearPointer(deps.userData);
+			} catch (e) {
+				warn("clearPointer", e);
+			}
 		}
-		deps.broadcast("runtime:rolled-back", failed?.version ?? null);
+		deps.broadcast("runtime:rolled-back", failedVersion ?? null);
 	};
 
 	const runCheck = async (): Promise<void> => {

@@ -101,9 +101,10 @@ describe("runtime-store: pointer", () => {
 		expect(readPointer(userData)).toBeNull();
 	});
 
-	it("readPointer normalizes a relative cliEntry against the canonical path", () => {
-		// Writing a relative form that resolves to the canonical absolute
-		// path is acceptable and must round-trip to the canonical form.
+	it("readPointer rejects a relative cliEntry even if it would resolve to the canonical path", () => {
+		// Pointer validity must not depend on `process.cwd()` at the
+		// moment of read — a relative form is always a packaging /
+		// hand-edit bug, not a legitimate state.
 		const canonical = cliEntryFor(userData, "1.0.0");
 		mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
 		const relative = path.relative(process.cwd(), canonical);
@@ -111,10 +112,7 @@ describe("runtime-store: pointer", () => {
 			pointerPathFor(userData),
 			JSON.stringify({ version: "1.0.0", cliEntry: relative }),
 		);
-		expect(readPointer(userData)).toEqual({
-			version: "1.0.0",
-			cliEntry: canonical,
-		});
+		expect(readPointer(userData)).toBeNull();
 	});
 
 	it("writePointer rejects a non-canonical cliEntry", () => {

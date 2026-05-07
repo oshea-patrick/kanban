@@ -13,8 +13,12 @@ interface RuntimeOrchestratorOptions {
 	resolveCliEntryOverride?: () => string | null;
 	/** Called when a staged spawn fails its readiness probe. The
 	 *  orchestrator retries once with the bundled cli on this same launch;
-	 *  the callback should clear any persistent pointer. */
-	onCliEntryOverrideFailed?: (reason: string) => void;
+	 *  the callback should clear/roll back the version it just tried.
+	 *  `cliEntry` is the exact override path used for the failed spawn —
+	 *  capturing it at spawn time avoids racing with a concurrent
+	 *  background staging that may have moved the pointer to a *new*
+	 *  version (which we must not roll back). */
+	onCliEntryOverrideFailed?: (reason: string, cliEntry: string) => void;
 	fetchImpl?: typeof fetch;
 	attachedProbeIntervalMs?: number;
 	attachedProbeFailureThreshold?: number;
@@ -75,9 +79,11 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	// at spawn time. Initial value `null` distinguishes "not yet looked
 	// up" from "looked up and resolved to a string".
 	private cachedShimPath: string | null = null;
-	// Captured at spawn time so the failure handler routes to
-	// `onCliEntryOverrideFailed` for the version that actually ran.
-	private currentSpawnUsedOverride = false;
+	// Captured at spawn time so the failure handler rolls back the
+	// version that actually ran — not whatever the pointer happens to
+	// say at failure time, which a concurrent background stage may have
+	// already replaced.
+	private currentSpawnOverridePath: string | null = null;
 	// Latched during the one same-launch fallback retry, so a callback
 	// that synchronously clears the pointer + a still-broken bundled
 	// runtime can't loop forever.
@@ -369,11 +375,12 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 			// launch with the bundled cli. The latch prevents an infinite
 			// loop if the bundled runtime is also broken.
 			const reason = err instanceof Error ? err.message : String(err);
-			if (this.currentSpawnUsedOverride && !this.overrideRetryInFlight) {
-				this.currentSpawnUsedOverride = false;
+			const failedOverride = this.currentSpawnOverridePath;
+			if (failedOverride && !this.overrideRetryInFlight) {
+				this.currentSpawnOverridePath = null;
 				this.overrideRetryInFlight = true;
 				try {
-					this.opts.onCliEntryOverrideFailed?.(reason);
+					this.opts.onCliEntryOverrideFailed?.(reason, failedOverride);
 				} catch (cbErr) {
 					console.warn(
 						"[desktop] onCliEntryOverrideFailed threw:",
@@ -391,7 +398,7 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 				}
 				return;
 			}
-			this.currentSpawnUsedOverride = false;
+			this.currentSpawnOverridePath = null;
 			// Suppress on terminated — caller (drain inside shutdown/dispose)
 			// already moved past the point where it cares about the spawn
 			// failure, and re-throwing would surface as an unhandled
@@ -429,7 +436,7 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	}
 
 	private resolveCliEntryOverride(): string | undefined {
-		this.currentSpawnUsedOverride = false;
+		this.currentSpawnOverridePath = null;
 		const resolver = this.opts.resolveCliEntryOverride;
 		if (!resolver) return undefined;
 		let override: string | null;
@@ -443,7 +450,7 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 			return undefined;
 		}
 		if (!override) return undefined;
-		this.currentSpawnUsedOverride = true;
+		this.currentSpawnOverridePath = override;
 		console.log(`[desktop] Runtime override → ${override}`);
 		return override;
 	}

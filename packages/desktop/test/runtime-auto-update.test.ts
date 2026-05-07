@@ -11,6 +11,7 @@
  */
 
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -149,17 +150,39 @@ describe("createRuntimeAutoUpdate: resolveCliEntryOverride", () => {
 		expect(readPointer(userData)).toBeNull();
 	});
 
-	it("clears a non-canonical pointer (treated as no pointer by readPointer)", () => {
+	it("clears a non-canonical pointer file (deletes it, not just rejects it)", () => {
 		// A tampered current.json with cliEntry pointing outside the
-		// runtime-store should never be honored.
-		mkdirSync(path.join(userData, "runtime-store"), { recursive: true });
+		// runtime-store should never be honored — and the bad file
+		// itself must be removed, otherwise it lingers as visible state
+		// forever even though every loadOverride() call ignores it.
+		const pointerFile = path.join(
+			userData,
+			"runtime-store",
+			"current.json",
+		);
+		mkdirSync(path.dirname(pointerFile), { recursive: true });
 		writeFileSync(
-			path.join(userData, "runtime-store", "current.json"),
+			pointerFile,
 			JSON.stringify({ version: "0.1.71", cliEntry: "/etc/passwd" }),
 		);
 
 		const auto = buildAutoUpdate();
 		expect(auto?.resolveCliEntryOverride()).toBeNull();
+		expect(existsSync(pointerFile)).toBe(false);
+	});
+
+	it("clears a corrupt-JSON pointer file", () => {
+		const pointerFile = path.join(
+			userData,
+			"runtime-store",
+			"current.json",
+		);
+		mkdirSync(path.dirname(pointerFile), { recursive: true });
+		writeFileSync(pointerFile, "{not-json");
+
+		const auto = buildAutoUpdate();
+		expect(auto?.resolveCliEntryOverride()).toBeNull();
+		expect(existsSync(pointerFile)).toBe(false);
 	});
 
 	it("falls back to shellVersion as bundled when app.asar.unpacked/cli/package.json is missing", () => {
@@ -182,7 +205,7 @@ describe("createRuntimeAutoUpdate: onCliEntryOverrideFailed (rollback)", () => {
 		writePointer(userData, { version: "0.1.71", cliEntry });
 
 		const auto = buildAutoUpdate();
-		auto?.onCliEntryOverrideFailed("spawn ENOENT");
+		auto?.onCliEntryOverrideFailed("spawn ENOENT", cliEntry);
 
 		expect(isBadVersion(userData, "0.1.71")).toBe(true);
 		expect(readPointer(userData)).toBeNull();
@@ -192,9 +215,38 @@ describe("createRuntimeAutoUpdate: onCliEntryOverrideFailed (rollback)", () => {
 		expect(broadcast).toHaveBeenCalledWith("runtime:rolled-back", "0.1.71");
 	});
 
-	it("broadcasts rollback with null when no pointer is present", () => {
+	it("does NOT clear the pointer when a concurrent stage already advanced it", () => {
+		// Race: orchestrator spawned the staged 0.1.71 cli; while its
+		// readiness probe is still running, runCheck() finishes staging
+		// 0.1.72 and writes the pointer. The probe then fails. Rolling
+		// back "whatever the pointer says now" would mark/remove 0.1.72
+		// — a version we haven't even tried yet. The captured failed
+		// cliEntry is the source of truth.
+		const failedCli = stageVersion("0.1.71");
+		const newerCli = stageVersion("0.1.72");
+		writePointer(userData, { version: "0.1.72", cliEntry: newerCli });
+
 		const auto = buildAutoUpdate();
-		auto?.onCliEntryOverrideFailed("bundled spawn failed");
+		auto?.onCliEntryOverrideFailed("spawn ENOENT", failedCli);
+
+		// The failed (older) version is rolled back...
+		expect(isBadVersion(userData, "0.1.71")).toBe(true);
+		expect(existsSync(versionDir(userData, "0.1.71"))).toBe(false);
+		// ...but the newer pointer is left intact.
+		expect(readPointer(userData)?.version).toBe("0.1.72");
+		expect(isBadVersion(userData, "0.1.72")).toBe(false);
+		expect(existsSync(versionDir(userData, "0.1.72"))).toBe(true);
+		// Broadcast still names the version that *failed*, not the one in pointer.
+		expect(broadcast).toHaveBeenCalledWith("runtime:rolled-back", "0.1.71");
+	});
+
+	it("broadcasts rollback with null when cliEntry doesn't fit the canonical layout", () => {
+		// Defensive: the orchestrator should only ever pass cliEntry
+		// values that came from `resolveCliEntryOverride()`, but if
+		// something exotic gets through, we still want the renderer to
+		// hear *some* rollback signal rather than silently swallow.
+		const auto = buildAutoUpdate();
+		auto?.onCliEntryOverrideFailed("bundled spawn failed", "/exotic/path");
 		expect(broadcast).toHaveBeenCalledWith("runtime:rolled-back", null);
 	});
 });

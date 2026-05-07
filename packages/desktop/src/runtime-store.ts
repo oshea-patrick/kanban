@@ -58,6 +58,20 @@ export function cliEntryFor(userData: string, version: string): string {
 	return path.join(versionDir(userData, version), "dist", "cli.js");
 }
 
+/**
+ * Inverse of `cliEntryFor`. Walks back from a canonical cliEntry to
+ * its `<v>` segment. Returns `null` if the path doesn't fit the
+ * `versions/<v>/dist/cli.js` shape or `<v>` isn't valid semver.
+ *
+ * Callers that capture the override path at spawn time use this to
+ * roll back the version that *actually* ran — without re-reading the
+ * pointer (which a concurrent background stage may have replaced).
+ */
+export function versionFromCliEntry(cliEntry: string): string | null {
+	const v = path.basename(path.dirname(path.dirname(cliEntry)));
+	return isSemver(v) ? v : null;
+}
+
 function atomicWrite(target: string, body: string): void {
 	mkdirSync(path.dirname(target), { recursive: true });
 	const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
@@ -83,9 +97,27 @@ export function readPointer(userData: string): RuntimePointer | null {
 	const { version, cliEntry } = parsed as Record<string, unknown>;
 	if (!isSemver(version)) return null;
 	if (typeof cliEntry !== "string" || cliEntry.length === 0) return null;
-	const canonical = cliEntryFor(userData, version);
-	if (path.resolve(cliEntry) !== canonical) return null;
-	return { version, cliEntry: canonical };
+	// Require absolute paths only — the on-disk contract is "absolute
+	// canonical path under runtime-store/". Accepting a relative form
+	// here would make pointer validity depend on `process.cwd()` at the
+	// moment of read, which is cwd-dependent footgun for no benefit.
+	if (!path.isAbsolute(cliEntry)) return null;
+	if (cliEntry !== cliEntryFor(userData, version)) return null;
+	return { version, cliEntry };
+}
+
+/**
+ * Whether a `current.json` exists on disk regardless of whether it
+ * parses/validates. Used by callers that need to clean up an invalid
+ * pointer file (e.g. tampered or hand-edited) — `readPointer()` returning
+ * null doesn't tell them apart from "no pointer at all".
+ */
+export function pointerFileExists(userData: string): boolean {
+	try {
+		return statSync(pointerPath(userData)).isFile();
+	} catch {
+		return false;
+	}
 }
 
 export function writePointer(userData: string, p: RuntimePointer): void {

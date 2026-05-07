@@ -1960,6 +1960,13 @@ describe("RuntimeOrchestrator cliEntryOverride wiring + fallback", () => {
 		expect(onCliEntryOverrideFailed.mock.calls[0]?.[0]).toMatch(
 			/ENOENT staged\/cli.js/,
 		);
+		// `cliEntry` must be captured at spawn time and forwarded —
+		// not re-derived from the pointer at failure time, which a
+		// concurrent background stage could have advanced. See
+		// runtime-auto-update onFailed for the matching consumer.
+		expect(onCliEntryOverrideFailed.mock.calls[0]?.[1]).toBe(
+			"/staged/v1/dist/cli.js",
+		);
 
 		// Two child managers were constructed — first staged (failed),
 		// second bundled (succeeded).

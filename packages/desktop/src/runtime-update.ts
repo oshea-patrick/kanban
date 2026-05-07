@@ -20,8 +20,9 @@ import {
 	cliEntryFor,
 	isBadVersion,
 	partialDir,
-	readPointer,
+	resolvePointerCliEntry,
 	versionDir,
+	versionFromCliEntry,
 	writePointer,
 } from "./runtime-store.js";
 
@@ -61,7 +62,15 @@ export async function checkAndStageLatestRuntime(
 	if (isBadVersion(opts.userData, latest)) {
 		return { kind: "bad-version", version: latest };
 	}
-	if (readPointer(opts.userData)?.version === latest) {
+	// `already-staged` requires both a pointer at `latest` AND its
+	// `cliEntry` actually present on disk. Without the file-exists
+	// check this gate would silently lie when the version dir was
+	// wiped (corrupt userData, manual cleanup, partial uninstall),
+	// leaving the user's runtime in a state where loadOverride keeps
+	// returning null *and* the updater keeps short-circuiting on
+	// "already-staged" forever.
+	const stagedCli = resolvePointerCliEntry(opts.userData);
+	if (stagedCli && versionFromCliEntry(stagedCli) === latest) {
 		return { kind: "already-staged" };
 	}
 
