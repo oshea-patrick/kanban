@@ -89,6 +89,43 @@ describe("runtime-store: pointer", () => {
 		).toThrow(/invalid semver/);
 	});
 
+	it("readPointer rejects a non-canonical cliEntry", () => {
+		// `cliEntry` is forwarded to the shim as KANBAN_CLI_OVERRIDE.
+		// A non-canonical path would let a tampered current.json execute
+		// arbitrary on-disk JS, so the pointer must be rejected.
+		mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
+		writeFileSync(
+			pointerPathFor(userData),
+			JSON.stringify({ version: "1.0.0", cliEntry: "/elsewhere/cli.js" }),
+		);
+		expect(readPointer(userData)).toBeNull();
+	});
+
+	it("readPointer normalizes a relative cliEntry against the canonical path", () => {
+		// Writing a relative form that resolves to the canonical absolute
+		// path is acceptable and must round-trip to the canonical form.
+		const canonical = cliEntryFor(userData, "1.0.0");
+		mkdirSync(path.dirname(pointerPathFor(userData)), { recursive: true });
+		const relative = path.relative(process.cwd(), canonical);
+		writeFileSync(
+			pointerPathFor(userData),
+			JSON.stringify({ version: "1.0.0", cliEntry: relative }),
+		);
+		expect(readPointer(userData)).toEqual({
+			version: "1.0.0",
+			cliEntry: canonical,
+		});
+	});
+
+	it("writePointer rejects a non-canonical cliEntry", () => {
+		expect(() =>
+			writePointer(userData, {
+				version: "1.0.0",
+				cliEntry: "/elsewhere/cli.js",
+			}),
+		).toThrow(/cliEntry for 1\.0\.0 must be/);
+	});
+
 	it("clearPointer is a no-op when missing and removes when present", () => {
 		expect(() => clearPointer(userData)).not.toThrow();
 		const cliEntry = stageVersion(userData, "0.1.0");

@@ -8,6 +8,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+import semver from "semver";
+
 import {
 	cleanupPartials,
 	clearPointer,
@@ -60,21 +62,32 @@ export function createRuntimeAutoUpdate(
 	let interval: NodeJS.Timeout | null = null;
 	let inFlight = false;
 
-	// Self-repair: a pointer whose `cliEntry` no longer exists on disk
-	// (user wiped userData, aborted update, etc.) gets dropped here.
-	// Without this, the version gate would forever read the stale
-	// pointer's version as `currentVersion` and skip new versions.
+	const dropPointer = (why: string): void => {
+		console.warn(`[desktop] ${why} — clearing pointer.`);
+		try {
+			clearPointer(deps.userData);
+		} catch (e) {
+			warn("clearPointer", e);
+		}
+	};
+
+	// Effective launch version is `max(pointer, bundled)`. A pointer
+	// at-or-below bundled is stale (e.g. user updated the shell while
+	// userData still pointed at an older staged runtime); without this
+	// guard we'd keep launching the older runtime forever. Also
+	// self-repairs pointers whose `cliEntry` no longer exists.
 	const loadOverride = (): string | null => {
+		const pointer = readPointer(deps.userData);
+		if (!pointer) return null;
+		if (semver.lte(pointer.version, bundledVersion)) {
+			dropPointer(
+				`Staged ${pointer.version} <= bundled ${bundledVersion}`,
+			);
+			return null;
+		}
 		const cli = resolvePointerCliEntry(deps.userData);
 		if (cli) return cli;
-		if (readPointer(deps.userData)) {
-			console.warn("[desktop] Staged cliEntry missing — clearing pointer.");
-			try {
-				clearPointer(deps.userData);
-			} catch (e) {
-				warn("clearPointer", e);
-			}
-		}
+		dropPointer("Staged cliEntry missing");
 		return null;
 	};
 
@@ -111,10 +124,14 @@ export function createRuntimeAutoUpdate(
 		if (inFlight) return;
 		inFlight = true;
 		try {
+			// Side effect: drops a stale-or-broken pointer so the
+			// version gate below sees an accurate `max(pointer, bundled)`.
+			loadOverride();
+			const ptr = readPointer(deps.userData);
 			const currentVersion =
-				loadOverride() === null
-					? bundledVersion
-					: (readPointer(deps.userData)?.version ?? bundledVersion);
+				ptr && semver.gt(ptr.version, bundledVersion)
+					? ptr.version
+					: bundledVersion;
 			const outcome = await checkAndStageLatestRuntime({
 				userData: deps.userData,
 				currentVersion,

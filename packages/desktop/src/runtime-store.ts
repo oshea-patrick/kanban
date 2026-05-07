@@ -65,6 +65,13 @@ function atomicWrite(target: string, body: string): void {
 	renameSync(tmp, target);
 }
 
+/**
+ * Pointer's `cliEntry` must be the canonical path for the pointer's
+ * version. We pass `cliEntry` to the shim as `KANBAN_CLI_OVERRIDE`,
+ * so a non-canonical or out-of-tree path would let a tampered
+ * `current.json` execute arbitrary on-disk JS. Returns the canonical
+ * absolute path so callers don't have to re-resolve.
+ */
 export function readPointer(userData: string): RuntimePointer | null {
 	let parsed: unknown;
 	try {
@@ -76,14 +83,25 @@ export function readPointer(userData: string): RuntimePointer | null {
 	const { version, cliEntry } = parsed as Record<string, unknown>;
 	if (!isSemver(version)) return null;
 	if (typeof cliEntry !== "string" || cliEntry.length === 0) return null;
-	return { version, cliEntry };
+	const canonical = cliEntryFor(userData, version);
+	if (path.resolve(cliEntry) !== canonical) return null;
+	return { version, cliEntry: canonical };
 }
 
 export function writePointer(userData: string, p: RuntimePointer): void {
 	if (!isSemver(p.version)) {
 		throw new Error(`runtime-store: invalid semver: ${p.version}`);
 	}
-	atomicWrite(pointerPath(userData), `${JSON.stringify(p)}\n`);
+	const canonical = cliEntryFor(userData, p.version);
+	if (path.resolve(p.cliEntry) !== canonical) {
+		throw new Error(
+			`runtime-store: cliEntry for ${p.version} must be ${canonical}, got ${p.cliEntry}`,
+		);
+	}
+	atomicWrite(
+		pointerPath(userData),
+		`${JSON.stringify({ version: p.version, cliEntry: canonical })}\n`,
+	);
 }
 
 export function clearPointer(userData: string): void {
@@ -119,9 +137,11 @@ export function removeVersionDir(userData: string, version: string): void {
 
 // -----------------------------------------------------------------
 // Bad-version markers — stop the updater from re-staging a version
-// that already failed startup. Self-empties as soon as upstream
-// publishes a newer version (the version gate compares against
-// max(pointer, bundled), so old entries are unreachable).
+// that already failed startup. Entries are never pruned; the registry
+// only publishes monotonically increasing versions and we only ever
+// check `isBadVersion(latest)`, so old entries are dead weight (a few
+// bytes) but never re-examined. If the file ever needs trimming, do
+// it lazily here against an `effectiveCurrentVersion` argument.
 // -----------------------------------------------------------------
 
 function readBadVersions(userData: string): string[] {
