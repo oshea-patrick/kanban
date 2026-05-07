@@ -125,24 +125,39 @@ export function createRuntimeAutoUpdate(
 				failedVersion ? `; rolling back ${failedVersion}` : ""
 			}${pointerStillFailed ? "" : " (pointer already advanced)"}.`,
 		);
+		// `markBadVersion` is the critical step: without it the next
+		// `runCheck` would just re-stage the same broken version. We
+		// gate `clearPointer` on it so a transient write failure (disk
+		// full, EPERM) doesn't leave the system in a state where the
+		// pointer is dropped *and* the version isn't blacklisted —
+		// which would loop on every `runCheck` ad infinitum. With this
+		// gating, the user still launches successfully (via the
+		// orchestrator's same-launch fallback to bundled), and we
+		// retry `markBadVersion` on every subsequent boot until it
+		// succeeds.
+		let marked = false;
 		if (failedVersion) {
 			try {
 				markBadVersion(deps.userData, failedVersion);
+				marked = true;
 			} catch (e) {
 				warn("markBadVersion", e);
 			}
-			try {
-				removeVersionDir(deps.userData, failedVersion);
-			} catch (e) {
-				warn("removeVersionDir", e);
+			if (marked) {
+				try {
+					removeVersionDir(deps.userData, failedVersion);
+				} catch (e) {
+					warn("removeVersionDir", e);
+				}
 			}
 		}
-		// Only clear the pointer if it still references the failed
-		// version. If a background stage already replaced it with a
-		// newer version, that version is presumed-good until proven
-		// otherwise — don't drop a healthy successor pointer because of
-		// a probe failure on a now-orphaned older spawn.
-		if (pointerStillFailed) {
+		// Two independent gates on `clearPointer`:
+		//   - `marked`: don't drop the pointer if we couldn't blacklist
+		//     the failed version (see comment above).
+		//   - `pointerStillFailed`: a concurrent `runCheck` may have
+		//     already advanced the pointer to a newer presumed-good
+		//     version; don't clobber that.
+		if (marked && pointerStillFailed) {
 			try {
 				clearPointer(deps.userData);
 			} catch (e) {
@@ -213,12 +228,22 @@ export function createRuntimeAutoUpdate(
 	};
 }
 
+/**
+ * Read `version` from `<cliDir>/package.json` and validate as semver.
+ * Defends against a corrupt/hand-edited `cli/package.json`: a non-string
+ * or non-semver `version` field would otherwise propagate into
+ * `bundledVersion`, and the very first `semver.lte/gt` against it (in
+ * `loadOverride` or `runCheck`) would throw a TypeError on the hot
+ * startup path. Returning `null` here lets the caller fall back to
+ * `shellVersion` instead.
+ */
 function readBundledVersion(cliDir: string): string | null {
 	try {
 		const parsed = JSON.parse(
 			readFileSync(path.join(cliDir, "package.json"), "utf8"),
 		) as { version?: unknown };
-		return typeof parsed.version === "string" ? parsed.version : null;
+		if (typeof parsed.version !== "string") return null;
+		return semver.valid(parsed.version) ? parsed.version : null;
 	} catch {
 		return null;
 	}

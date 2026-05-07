@@ -197,6 +197,44 @@ describe("createRuntimeAutoUpdate: resolveCliEntryOverride", () => {
 		// shellVersion 0.1.71 == pointer 0.1.71 → still <= bundled, so cleared.
 		expect(auto?.resolveCliEntryOverride()).toBeNull();
 	});
+
+	it("falls back to shellVersion when cli/package.json has a non-semver version (no TypeError on hot path)", () => {
+		// Regression: `readBundledVersion` previously returned any string
+		// `version` field unchecked, so a corrupt/hand-edited
+		// `cli/package.json` (e.g. truncated mid-write, or a packaging
+		// bug producing a placeholder) would propagate "abc" into
+		// `bundledVersion`. The very first `semver.lte/gt` against it
+		// would then throw TypeError on the hot startup path. We now
+		// validate-and-fall-back to `shellVersion`, so this is safe.
+		const cliDir = path.join(resourcesPath, "app.asar.unpacked", "cli");
+		mkdirSync(cliDir, { recursive: true });
+		writeFileSync(
+			path.join(cliDir, "package.json"),
+			JSON.stringify({ name: "kanban", version: "abc" }),
+		);
+		const cliEntry = stageVersion("0.1.71");
+		writePointer(userData, { version: "0.1.71", cliEntry });
+
+		// shellVersion 0.1.71 == pointer 0.1.71 → cleared, no TypeError.
+		const auto = buildAutoUpdate({ shellVersion: "0.1.71" });
+		expect(() => auto?.resolveCliEntryOverride()).not.toThrow();
+		expect(auto?.resolveCliEntryOverride()).toBeNull();
+	});
+
+	it("falls back to shellVersion when cli/package.json's version is not a string", () => {
+		const cliDir = path.join(resourcesPath, "app.asar.unpacked", "cli");
+		mkdirSync(cliDir, { recursive: true });
+		writeFileSync(
+			path.join(cliDir, "package.json"),
+			JSON.stringify({ name: "kanban", version: 42 }),
+		);
+		const cliEntry = stageVersion("0.1.72");
+		writePointer(userData, { version: "0.1.72", cliEntry });
+
+		// shellVersion 0.1.71 < pointer 0.1.72 → returns the staged cli.
+		const auto = buildAutoUpdate({ shellVersion: "0.1.71" });
+		expect(auto?.resolveCliEntryOverride()).toBe(cliEntry);
+	});
 });
 
 describe("createRuntimeAutoUpdate: onCliEntryOverrideFailed (rollback)", () => {
@@ -248,6 +286,52 @@ describe("createRuntimeAutoUpdate: onCliEntryOverrideFailed (rollback)", () => {
 		const auto = buildAutoUpdate();
 		auto?.onCliEntryOverrideFailed("bundled spawn failed", "/exotic/path");
 		expect(broadcast).toHaveBeenCalledWith("runtime:rolled-back", null);
+	});
+
+	it("does NOT clear the pointer when markBadVersion fails (avoid re-stage loop)", () => {
+		// Regression: `clearPointer` previously fired unconditionally after
+		// `markBadVersion`'s try/catch. If `markBadVersion` throws
+		// (disk full, EPERM on bad-versions.json), the pointer would
+		// still be dropped — and since the version isn't blacklisted,
+		// the next `runCheck()` would re-extract the same broken
+		// version, write the pointer again, and crash on the next
+		// launch. Loop forever until disk frees.
+		//
+		// Fix: gate `clearPointer` on `markBadVersion` succeeding. The
+		// user still launches successfully via the orchestrator's
+		// same-launch retry to bundled; the pointer just stays in place
+		// so the failure keeps retrying `markBadVersion` rather than
+		// looping `runCheck → re-extract → fail`.
+		const cliEntry = stageVersion("0.1.71");
+		writePointer(userData, { version: "0.1.71", cliEntry });
+
+		// Force the bad-versions write to fail by replacing its parent
+		// (the runtime-store dir) with a regular file. Atomic-write's
+		// mkdirSync(recursive) → writeFileSync → renameSync chain will
+		// trip on whichever step hits the file-where-dir-is-expected.
+		// We create the file *after* the pointer write above, since
+		// that needs the dir to exist.
+		const badVersions = path.join(
+			userData,
+			"runtime-store",
+			"bad-versions.json",
+		);
+		// Replace bad-versions.json's would-be location with a directory
+		// so writeFileSync at that path EISDIRs.
+		mkdirSync(badVersions, { recursive: true });
+
+		const auto = buildAutoUpdate();
+		auto?.onCliEntryOverrideFailed("spawn ENOENT", cliEntry);
+
+		// Pointer must remain — without it, a future `runCheck()` would
+		// re-stage the same broken version (since !isBadVersion is true).
+		expect(readPointer(userData)).not.toBeNull();
+		expect(isBadVersion(userData, "0.1.71")).toBe(false);
+		// Version dir cleanup is gated on markBad too — both stay so
+		// the next attempt has the same starting state to retry against.
+		expect(existsSync(versionDir(userData, "0.1.71"))).toBe(true);
+		// Renderer still hears the rollback so the UI can react.
+		expect(broadcast).toHaveBeenCalledWith("runtime:rolled-back", "0.1.71");
 	});
 });
 
