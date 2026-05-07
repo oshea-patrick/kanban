@@ -1,5 +1,4 @@
 import { BrowserWindow, app, dialog, ipcMain } from "electron";
-import { readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -10,16 +9,8 @@ import {
 	parseProtocolUrl,
 	registerProtocol,
 } from "./protocol-handler.js";
+import { createRuntimeAutoUpdate } from "./runtime-auto-update.js";
 import { RuntimeOrchestrator } from "./runtime-orchestrator.js";
-import {
-	cleanupPartials,
-	clearPointer,
-	markBadVersion,
-	readPointer,
-	removeVersionDir,
-	resolvePointerCliEntry,
-} from "./runtime-store.js";
-import { checkAndStageLatestRuntime } from "./runtime-update.js";
 import { WindowFactory } from "./window-factory.js";
 import { WindowRegistry } from "./window-registry.js";
 
@@ -44,175 +35,22 @@ let isQuitting = false;
 
 const registry = new WindowRegistry();
 
-/**
- * Runtime-update wiring. Packaged-only:
- *   - The bundled `app.asar.unpacked/cli/cli.js` path doesn't exist in
- *     dev (dev uses the `kanban-dev` shim against `dist/cli.js`).
- *   - A dev-side store under `~/Library/Application Support/Kanban/`
- *     would hijack subsequent packaged-app launches ("ghost upgrade").
- * In dev `runtimeUpdate` is `null` and the orchestrator just spawns
- * the bundled cli.
- */
-interface RuntimeUpdateConfig {
-	userData: string;
-	bundledVersion: string;
-	nativeDepsSource: string;
-}
-
-function buildRuntimeUpdateConfig(): RuntimeUpdateConfig | null {
-	if (!app.isPackaged) return null;
-	// `process.resourcesPath` is `Kanban.app/Contents/Resources` on macOS
-	// and `kanban/resources` on Linux; both layouts have
-	// `app.asar.unpacked/` carved out per the `asarUnpack` rule.
-	const unpacked = path.join(process.resourcesPath, "app.asar.unpacked");
-	const bundledCliDir = path.join(unpacked, "cli");
-	return {
-		userData: app.getPath("userData"),
-		bundledVersion: readBundledRuntimeVersion(bundledCliDir),
-		// `node-pty` lives under `app.asar.unpacked/node_modules/` after
-		// `electron-builder install-app-deps` rebuilds it against the
-		// bundled Electron ABI. Each staged version copies it into its
-		// own `node_modules/` so updates launch without a native rebuild.
-		nativeDepsSource: path.join(unpacked, "node_modules"),
-	};
-}
-
-const runtimeUpdate = buildRuntimeUpdateConfig();
-
-// Sweep stale `<v>.partial/` dirs left behind by an extract that was
-// killed by a quit/crash. Runs *before* `connect()` so a partial dir
-// can't collide with a fresh extract on the next tick. Best-effort.
-if (runtimeUpdate) {
-	try {
-		cleanupPartials(runtimeUpdate.userData);
-	} catch (err) {
-		console.warn(
-			"[desktop] cleanupPartials failed:",
-			err instanceof Error ? err.message : err,
-		);
-	}
-}
-
-/**
- * Read the staged-runtime pointer and return the `cliEntry` *only* if
- * it actually exists on disk. `null` means "use bundled cli". Runs on
- * every spawn — a freshly staged version takes effect on the next
- * restart.
- *
- * Self-repair: if the pointer exists but its `cliEntry` is missing
- * (user wiped `~/Library/Application Support/.../runtime-store/`,
- * filesystem corruption, leftover from an aborted update), we clear
- * the pointer here. Without this, `runRuntimeUpdateCheck` would
- * forever read the stale pointer's version as `currentVersion` and
- * skip staging when `latest === pointer.version`, permanently
- * suppressing updates.
- *
- * Note: rollback semantics. We only clear/mark-bad on *startup-probe*
- * failure (orchestrator's `onCliEntryOverrideFailed`). A runtime that
- * passes startup and then crashes later is treated as a transient
- * crash, not a versioning issue — recovery probe + user-driven restart
- * handle it. The pointer survives.
- */
-function loadStagedCliOverride(userData: string): string | null {
-	const cliEntry = resolvePointerCliEntry(userData);
-	if (cliEntry) return cliEntry;
-	if (readPointer(userData)) {
-		// Pointer exists but `cliEntry` is missing on disk. Self-repair
-		// so the background updater isn't permanently silenced by a
-		// stale pointer. Best-effort — if the unlink itself fails, the
-		// updater path tolerates a stale pointer (defends with
-		// `semver.valid(opts.currentVersion)` upstream).
-		console.warn(
-			`[desktop] Staged runtime cliEntry missing — clearing pointer to self-repair.`,
-		);
-		try {
-			clearPointer(userData);
-		} catch (err) {
-			console.warn(
-				"[desktop] clearPointer failed during self-repair:",
-				err instanceof Error ? err.message : err,
-			);
-		}
-	}
-	return null;
-}
+const autoUpdate = createRuntimeAutoUpdate({
+	isPackaged: app.isPackaged,
+	userData: app.getPath("userData"),
+	resourcesPath: process.resourcesPath,
+	shellVersion: app.getVersion(),
+	broadcast: broadcastToAllRenderers,
+});
 
 const orchestrator = new RuntimeOrchestrator({
 	host: DEFAULT_HOST,
 	port: DEFAULT_PORT,
 	healthTimeoutMs: HEALTH_TIMEOUT_MS,
 	resolveCliShimPath,
-	resolveCliEntryOverride: runtimeUpdate
-		? () => loadStagedCliOverride(runtimeUpdate.userData)
-		: undefined,
-	onCliEntryOverrideFailed: runtimeUpdate
-		? (reason) => {
-				// Staged runtime failed its readiness probe — mark the
-				// version bad so the background updater stops re-staging
-				// it (otherwise we'd re-download/re-prompt every 30 min
-				// for an incompatible `kanban@latest`), drop the pointer
-				// so this and subsequent launches both fall back to
-				// bundled, and remove the bad version dir to reclaim
-				// disk. The orchestrator immediately retries this same
-				// launch with the bundled cli.
-				const cfg = runtimeUpdate;
-				const failed = readPointer(cfg.userData);
-				console.warn(
-					`[desktop] Staged runtime failed (${reason}); rolling back${
-						failed ? ` ${failed.version}` : ""
-					}.`,
-				);
-				try {
-					if (failed) {
-						markBadVersion(cfg.userData, failed.version, cfg.bundledVersion);
-					}
-				} catch (err) {
-					console.warn(
-						"[desktop] markBadVersion failed:",
-						err instanceof Error ? err.message : err,
-					);
-				}
-				try {
-					clearPointer(cfg.userData);
-				} catch (err) {
-					console.warn(
-						"[desktop] clearPointer failed:",
-						err instanceof Error ? err.message : err,
-					);
-				}
-				if (failed) {
-					try {
-						removeVersionDir(cfg.userData, failed.version);
-					} catch (err) {
-						console.warn(
-							"[desktop] removeVersionDir failed:",
-							err instanceof Error ? err.message : err,
-						);
-					}
-				}
-				broadcastToAllRenderers("runtime:rolled-back", failed?.version ?? null);
-			}
-		: undefined,
+	resolveCliEntryOverride: autoUpdate?.resolveCliEntryOverride,
+	onCliEntryOverrideFailed: autoUpdate?.onCliEntryOverrideFailed,
 });
-
-function readBundledRuntimeVersion(bundledCliDir: string): string {
-	try {
-		const raw = readFileSync(path.join(bundledCliDir, "package.json"), "utf8");
-		const parsed = JSON.parse(raw) as { version?: unknown };
-		if (typeof parsed.version === "string" && parsed.version.length > 0) {
-			return parsed.version;
-		}
-	} catch (err) {
-		console.warn(
-			"[desktop] Could not read bundled runtime version from staged cli/package.json:",
-			err instanceof Error ? err.message : err,
-		);
-	}
-	// Fallback to the shell version. Off-by-one'd by definition (0.0.1 today),
-	// but harmless: every published `kanban@latest` will be `> 0.0.1` so the
-	// updater will install once and then read the pointer thereafter.
-	return app.getVersion();
-}
 
 const windowFactory = new WindowFactory({
 	preloadPath,
@@ -401,82 +239,6 @@ if (!gotTheLock) {
 	wireAppLifecycle();
 }
 
-// Runtime-update timers. Module-scoped so `before-quit` can clear them.
-// `null` while idle (dev, or before `whenReady` fires).
-let runtimeUpdateFirstTimer: NodeJS.Timeout | null = null;
-let runtimeUpdateInterval: NodeJS.Timeout | null = null;
-let runtimeUpdateInFlight = false;
-
-const FIRST_UPDATE_CHECK_DELAY_MS = 30_000;
-const UPDATE_CHECK_INTERVAL_MS = 30 * 60_000;
-
-async function runRuntimeUpdateCheck(cfg: RuntimeUpdateConfig): Promise<void> {
-	// Single-flight: a slow extract racing the periodic interval would
-	// otherwise re-enter and start a duplicate `pacote.extract` into the
-	// same `<v>.partial/`, fail the second one, and leave the registry
-	// poll counted twice.
-	if (runtimeUpdateInFlight) return;
-	runtimeUpdateInFlight = true;
-	try {
-		// `currentVersion` resolution: prefer a pointer that still has a
-		// real `cliEntry` on disk; otherwise drop the pointer (so a
-		// broken pointer can't permanently freeze the version gate) and
-		// fall back to bundled. `loadStagedCliOverride` already does
-		// this self-repair on the orchestrator hot-path; we mirror it
-		// here so the *background* updater agrees with the *spawn*
-		// updater on what version we'd actually launch right now.
-		const currentVersion =
-			loadStagedCliOverride(cfg.userData) === null
-				? cfg.bundledVersion
-				: (readPointer(cfg.userData)?.version ?? cfg.bundledVersion);
-
-		const outcome = await checkAndStageLatestRuntime({
-			userData: cfg.userData,
-			currentVersion,
-			nativeDepsSource: cfg.nativeDepsSource,
-			// Electron's bundled node — what would actually execute the
-			// staged runtime. Used to skip versions whose `engines.node`
-			// outgrew this shell.
-			nodeVersion: process.versions.node,
-		});
-		if (outcome.kind === "staged") {
-			console.log(
-				`[desktop] Staged kanban@${outcome.stagedVersion} — restart to apply.`,
-			);
-			broadcastToAllRenderers("runtime:update-staged", outcome.stagedVersion);
-		} else if (outcome.kind === "engines-incompatible") {
-			// One-shot warning per cycle — useful in logs to explain why
-			// the user isn't getting offered an update they see on npm.
-			console.log(
-				`[desktop] Skipping kanban@${outcome.version}: engines.node ${outcome.required} not satisfied by Electron node ${process.versions.node}.`,
-			);
-		} else if (outcome.kind === "bad-version") {
-			console.log(
-				`[desktop] Skipping kanban@${outcome.version}: previously failed startup on this shell.`,
-			);
-		} else if (outcome.kind === "unsupported-deps") {
-			// Defensive guardrail. If a future kanban@latest grows a new
-			// runtime dep the shell doesn't know how to provision from
-			// `app.asar.unpacked/node_modules/`, we'd otherwise stage a
-			// runtime that crashes at first `require`. Log loudly so the
-			// next desktop release can extend KNOWN_STAGEABLE_DEPS.
-			console.warn(
-				`[desktop] Skipping kanban@${outcome.version}: unsupported runtime deps ${outcome.extraDeps.join(", ")}.`,
-			);
-		}
-	} catch (err) {
-		// Network errors, registry hiccups, missing native deps — log
-		// and try again on the next tick. The pointer is intentionally
-		// untouched on any failure.
-		console.warn(
-			"[desktop] Runtime update check failed:",
-			err instanceof Error ? err.message : err,
-		);
-	} finally {
-		runtimeUpdateInFlight = false;
-	}
-}
-
 function wireAppLifecycle(): void {
 	app.whenReady().then(async () => {
 		// Electron normally creates `userData` itself, but some sandboxed
@@ -534,22 +296,8 @@ function wireAppLifecycle(): void {
 			windowFactory.showDisconnectedScreen();
 		}
 
-		// Schedule background runtime checks after connect. The 30s
-		// initial delay keeps the registry call out of the boot-spike
-		// window; the 30min interval handles long-lived sessions. Both
-		// timers `.unref()`'d so they don't keep the event loop alive at
-		// quit. Packaged-only — `runtimeUpdate` is `null` in dev.
-		if (runtimeUpdate) {
-			const cfg = runtimeUpdate;
-			runtimeUpdateFirstTimer = setTimeout(() => {
-				void runRuntimeUpdateCheck(cfg);
-			}, FIRST_UPDATE_CHECK_DELAY_MS);
-			runtimeUpdateFirstTimer.unref();
-			runtimeUpdateInterval = setInterval(() => {
-				void runRuntimeUpdateCheck(cfg);
-			}, UPDATE_CHECK_INTERVAL_MS);
-			runtimeUpdateInterval.unref();
-		}
+		// Background runtime-update checks. Packaged-only.
+		autoUpdate?.scheduleChecks();
 	});
 
 	app.on("window-all-closed", () => {
@@ -572,19 +320,11 @@ function wireAppLifecycle(): void {
 		// kill any post-teardown spawn.
 		event.preventDefault();
 		try {
-			// Stop background update timers before orchestrator.shutdown()
-			// so a check doesn't fire mid-teardown. Any extract that's
-			// already past `pacote.extract` will finish cleanly and write
-			// the pointer; one earlier than that gets dropped — its
-			// `<v>.partial/` will be swept on the next boot.
-			if (runtimeUpdateFirstTimer) {
-				clearTimeout(runtimeUpdateFirstTimer);
-				runtimeUpdateFirstTimer = null;
-			}
-			if (runtimeUpdateInterval) {
-				clearInterval(runtimeUpdateInterval);
-				runtimeUpdateInterval = null;
-			}
+			// Stop the update timers before shutdown so a check can't
+			// fire mid-teardown. Any extract already past pacote.extract
+			// finishes cleanly and writes the pointer; an earlier-stage
+			// one gets dropped — its `<v>.partial/` is swept next boot.
+			autoUpdate?.stop();
 			await orchestrator.shutdown();
 		} catch (err) {
 			console.error(

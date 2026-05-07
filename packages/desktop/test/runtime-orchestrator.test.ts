@@ -13,21 +13,9 @@ vi.mock("electron", () => ({
 const childManagers: FakeChildManager[] = [];
 
 class FakeChildManager extends EventEmitter {
-	/**
-	 * When set, the *next* `start()` call rejects with this error then
-	 * clears the field. Used by the runtime-rollback tests to simulate
-	 * a startup failure (e.g. the user-installed cli.js exited before
-	 * passing the health probe). Other tests don't touch this and so
-	 * see the default success path. One-shot semantics keep tests from
-	 * interfering with each other on shared state.
-	 */
+	/** One-shot: next `start()` rejects with this error, then clears. */
 	static nextStartError: Error | null = null;
-	/**
-	 * Records every options object the orchestrator passed to the
-	 * RuntimeChildManager constructor, in order. Used by the resolver
-	 * integration tests to assert the spawn picked up the right
-	 * `cliEntryOverride` after the resolver was queried.
-	 */
+	/** Constructor options observed across spawns, in order. */
 	static lastConstructorOptions: Array<Record<string, unknown>> = [];
 
 	constructor(options: Record<string, unknown> = {}) {

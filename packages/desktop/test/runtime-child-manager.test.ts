@@ -240,15 +240,8 @@ describe("RuntimeChildManager", () => {
 			expect(options.env.NODE_OPTIONS).not.toContain("4096");
 		});
 
-		// `cliEntryOverride` is the surface the runtime-update orchestrator
-		// uses to ask the shim to launch a user-installed cli.js (issue
-		// #438 / Channel 1). The contract: when set on the manager, the
-		// spawned shim's environment receives `KANBAN_CLI_OVERRIDE` with
-		// the same absolute path; when unset, that env var must not be
-		// present in the child's environment (the shim's existence check
-		// would still skip an empty value, but a stray empty var would
-		// be observably wrong in process listings and ill-defined under
-		// the shim's `[ -n "$KANBAN_CLI_OVERRIDE" ]` guard).
+		// `cliEntryOverride` is forwarded to the child env as
+		// `KANBAN_CLI_OVERRIDE` for the shim to pick up.
 		it("forwards cliEntryOverride to the child env as KANBAN_CLI_OVERRIDE", async () => {
 			const spawnSpy = createSpawnFn(mockChild);
 			manager = new RuntimeChildManager({
@@ -277,12 +270,7 @@ describe("RuntimeChildManager", () => {
 		});
 
 		it("treats an empty string cliEntryOverride as 'no override'", async () => {
-			// Defence in depth: callers that pipe through optional
-			// option chains often surface "" instead of undefined when
-			// the upstream value is missing. Setting `KANBAN_CLI_OVERRIDE=""`
-			// would be observably wrong in process listings even if the
-			// shim's `[ -n ... ]` guard would skip it; normalise to
-			// undefined at the env-write boundary.
+			// Optional-chained callers can surface "" instead of undefined.
 			const spawnSpy = createSpawnFn(mockChild);
 			manager = new RuntimeChildManager({
 				cliPath: CLI_PATH,

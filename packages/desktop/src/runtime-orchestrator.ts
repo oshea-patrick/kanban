@@ -9,22 +9,11 @@ interface RuntimeOrchestratorOptions {
 	port: number;
 	healthTimeoutMs: number;
 	resolveCliShimPath: () => string;
-	/**
-	 * Optional callback resolving the absolute path to a staged
-	 * `cli.js` that should run instead of the shim's bundled cli.
-	 * Returning `null` (or omitting the option) lets the shim use its
-	 * bundled `cli.js`. Re-evaluated on every spawn so a freshly-staged
-	 * runtime takes effect on the next restart.
-	 */
+	/** Re-evaluated on every spawn. `null` ⇒ use the shim's bundled cli. */
 	resolveCliEntryOverride?: () => string | null;
-	/**
-	 * Called when a spawn that *was* using a `cliEntryOverride` failed
-	 * to reach the ready-poll cutoff. The orchestrator clears the
-	 * override locally and retries the spawn once with the bundled
-	 * runtime — same launch, no user action required. The callback
-	 * itself is responsible for clearing the persistent pointer so
-	 * subsequent boots also fall back.
-	 */
+	/** Called when a staged spawn fails its readiness probe. The
+	 *  orchestrator retries once with the bundled cli on this same launch;
+	 *  the callback should clear any persistent pointer. */
 	onCliEntryOverrideFailed?: (reason: string) => void;
 	fetchImpl?: typeof fetch;
 	attachedProbeIntervalMs?: number;
@@ -86,16 +75,12 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 	// at spawn time. Initial value `null` distinguishes "not yet looked
 	// up" from "looked up and resolved to a string".
 	private cachedShimPath: string | null = null;
-	// Whether the *current* spawn is using a `cliEntryOverride` (i.e. a
-	// staged runtime). Captured at spawn time so the failure path can
-	// route to `onCliEntryOverrideFailed` for the version that actually
-	// ran, even if `resolveCliEntryOverride()` would now return something
-	// different.
+	// Captured at spawn time so the failure handler routes to
+	// `onCliEntryOverrideFailed` for the version that actually ran.
 	private currentSpawnUsedOverride = false;
-	// Latched for the duration of one same-launch retry after a staged
-	// spawn fails. Without it, an `onCliEntryOverrideFailed` callback
-	// that synchronously cleared the pointer + a still-broken bundled
-	// runtime could loop the retry forever.
+	// Latched during the one same-launch fallback retry, so a callback
+	// that synchronously clears the pointer + a still-broken bundled
+	// runtime can't loop forever.
 	private overrideRetryInFlight = false;
 
 	// Latched once `shutdown()` / `dispose()` begin. Every `await` boundary
@@ -379,14 +364,11 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 				this.manager.removeAllListeners("error");
 				this.manager = null;
 			}
+			// A staged runtime that failed its readiness probe is broken;
+			// notify the host (clears the pointer) and retry the same
+			// launch with the bundled cli. The latch prevents an infinite
+			// loop if the bundled runtime is also broken.
 			const reason = err instanceof Error ? err.message : String(err);
-			// Rollback: a staged runtime that failed to come up before
-			// the ready-poll cutoff is broken. Notify the host (which
-			// clears the persistent pointer) and retry once with the
-			// bundled cli — same launch, no user action required. The
-			// `overrideRetryInFlight` latch ensures a still-broken
-			// bundled runtime can't loop us forever; a second failure
-			// (now without override) just propagates normally.
 			if (this.currentSpawnUsedOverride && !this.overrideRetryInFlight) {
 				this.currentSpawnUsedOverride = false;
 				this.overrideRetryInFlight = true;
@@ -399,7 +381,7 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 					);
 				}
 				console.warn(
-					`[desktop] Staged runtime spawn failed (${reason}). Falling back to bundled cli.`,
+					`[desktop] Staged runtime failed (${reason}); falling back to bundled.`,
 				);
 				if (this.terminated) return;
 				try {
@@ -446,36 +428,21 @@ export class RuntimeOrchestrator extends EventEmitter<RuntimeOrchestratorEventMa
 		return resolved;
 	}
 
-	/**
-	 * Resolve which cli.js the shim should execute. Captures
-	 * `currentSpawnUsedOverride` so the failure path knows whether to
-	 * trigger same-launch fallback. Returns `undefined` (i.e. no env
-	 * override) when no callback is wired or it returned `null`, in
-	 * which case the shim finds bundled `cli.js` itself.
-	 */
 	private resolveCliEntryOverride(): string | undefined {
+		this.currentSpawnUsedOverride = false;
 		const resolver = this.opts.resolveCliEntryOverride;
-		if (!resolver) {
-			this.currentSpawnUsedOverride = false;
-			return undefined;
-		}
+		if (!resolver) return undefined;
 		let override: string | null;
 		try {
 			override = resolver();
 		} catch (err) {
-			// Don't let a buggy resolver brick the whole spawn. Log and
-			// fall through to bundled.
 			console.warn(
 				"[desktop] resolveCliEntryOverride threw:",
 				err instanceof Error ? err.message : err,
 			);
-			this.currentSpawnUsedOverride = false;
 			return undefined;
 		}
-		if (!override) {
-			this.currentSpawnUsedOverride = false;
-			return undefined;
-		}
+		if (!override) return undefined;
 		this.currentSpawnUsedOverride = true;
 		console.log(`[desktop] Runtime override → ${override}`);
 		return override;
